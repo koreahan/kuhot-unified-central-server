@@ -775,7 +775,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v026-unified-central-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v027-unified-central-backfill-10d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -789,6 +789,41 @@ app.get('/debug/latest', async (req, res) => {
     res.json({ ok: true, count: alerts.length, latest: alerts[0] || null, items: alerts.map(a => ({ id: a.id, section: a.section, title: a.title, price: a.price, source: a.source, createdAt: a.createdAt })) });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+
+// 백필 전용: 기존 WowDrop SQLite DB의 최근 N일 가격기록을 서버 DB에 심는 용도.
+// 알림/푸시/텔레그램을 만들지 않고 price_observations에만 저장한다.
+app.post('/collector/backfill-batch', async (req, res) => {
+  try {
+    if (!allowCollector(req, res)) return;
+    const items = Array.isArray(req.body?.items) ? req.body.items : (Array.isArray(req.body) ? req.body : []);
+    if (!items.length) return res.status(400).json({ ok: false, error: 'EMPTY_ITEMS' });
+
+    const common = req.body?.common && typeof req.body.common === 'object' ? req.body.common : {};
+    const results = [];
+    let inserted = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const item of items.slice(0, 200)) {
+      try {
+        const merged = { ...common, ...item, source: item.source || common.source || 'wowdrop_sqlite_backfill' };
+        const obs = normalizeObservation(merged);
+        const obsResult = await insertObservation(obs, req);
+        if (obsResult.inserted) inserted += 1;
+        else skipped += 1;
+        results.push({ ok: true, inserted: obsResult.inserted, title: obs.title, option: obs.option, price: obs.price, collectedAt: obs.collectedAt });
+      } catch (e) {
+        failed += 1;
+        results.push({ ok: false, error: String(e.message || e), raw: item });
+      }
+    }
+
+    res.json({ ok: true, mode: 'backfill_only_no_alert_no_push', count: results.length, inserted, skipped, failed, results });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
 
