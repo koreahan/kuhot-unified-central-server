@@ -312,7 +312,13 @@ function formatCollectorFullTemplate(a) {
   if (a.cardText) lines.push(`💳 카드할인 : ${a.cardText}`);
   lines.push('');
   if (avg > 0 && avg !== low) lines.push(`📉 평균 ${won(avg)} · 🔻${formatPct1(avgDrop)}% (${won(avgDiff)})`);
-  if (low > 0) lines.push(`🏆 최저 ${won(low)} · 🔻${formatPct1(lowDrop)}% (${won(lowDiff)})`);
+  if (low > 0) {
+    if (price > 0 && Math.round(price) === Math.round(low)) {
+      lines.push('🏆 기존 최저가와 동일');
+    } else if (price > 0 && price < low) {
+      lines.push(`🏆 최저 ${won(low)} · 🔻${formatPct1(lowDrop)}% (${won(lowDiff)})`);
+    }
+  }
   lines.push('');
   lines.push('🔗 상세보기 및 구매하기');
   if (url) lines.push(url);
@@ -402,6 +408,8 @@ function parseTelegramText(text, body = {}) {
   const dropPct = f(body.dropPct || body.avgDrop || (avg > 0 && price > 0 ? ((avg - price) / avg) * 100 : 0));
 
   return normalizeAlert({
+    // v034: text 경로에서도 수동 버튼/키위 재요청 dedupeKey를 보존한다.
+    dedupeKey: s(body.dedupeKey, 240),
     source: body.source || 'telegram_bridge',
     section,
     title,
