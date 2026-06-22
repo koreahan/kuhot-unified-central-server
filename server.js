@@ -278,6 +278,47 @@ function pushCompactText(a) {
   return `${pushTitle(a)}\n${pushMessage(a)}`;
 }
 
+function formatPct1(v) {
+  const x = Math.round(f(v) * 10) / 10;
+  return Number.isInteger(x) ? String(x) : x.toFixed(1);
+}
+
+function formatCollectorFullTemplate(a) {
+  const raw = a.raw || {};
+  const obs = raw.observation || {};
+  const obsRaw = obs.raw || {};
+  const stats = raw.stats || {};
+  const decision = raw.decision || {};
+  const title = s(a.title || obs.title || '상품', 500);
+  const option = s(a.option || obs.option || '', 300);
+  const price = n(a.price || obs.price);
+  const avg = n(a.avg || stats.avg);
+  const low = n(a.low || stats.low);
+  const avgDrop = f(a.dropPct || decision.avgDropPct || (avg > 0 && price > 0 ? ((avg - price) / avg) * 100 : 0));
+  const lowDrop = f(decision.lowDropPct || (low > 0 && price > 0 ? ((low - price) / low) * 100 : 0));
+  const avgDiff = avg > 0 && price > 0 ? Math.max(0, avg - price) : 0;
+  const lowDiff = low > 0 && price > 0 ? Math.max(0, low - price) : 0;
+  const url = s(a.url || a.partnerUrl || obs.partnerUrl || obs.url || '', 1000);
+  const hasFresh = !!(obsRaw.hasFresh || obsRaw.raw?.hasFresh);
+  const hasJikgu = !!(obsRaw.hasJikgu || obsRaw.raw?.hasJikgu);
+  const badge = hasFresh ? ' [로켓프레시❄️]' : (hasJikgu ? ' [로켓직구🌏]' : '');
+  const label = isBigAlert(a) ? '🔥대박🔥 최종 혜택가 :' : '💰 최종 혜택가 :';
+  const lines = [];
+  lines.push('※ 파트너스활동으로 수수료를 제공받습니다.');
+  lines.push(`✨ ${title}${badge}`);
+  if (option) lines.push(`└ ${option}`);
+  lines.push('');
+  lines.push(`${label} ${won(price)}`);
+  if (a.cardText) lines.push(`💳 카드할인 : ${a.cardText}`);
+  lines.push('');
+  if (avg > 0 && avg !== low) lines.push(`📉 평균 ${won(avg)} · 🔻${formatPct1(avgDrop)}% (${won(avgDiff)})`);
+  if (low > 0) lines.push(`🏆 최저 ${won(low)} · 🔻${formatPct1(lowDrop)}% (${won(lowDiff)})`);
+  lines.push('');
+  lines.push('🔗 상세보기 및 구매하기');
+  if (url) lines.push(url);
+  return lines.join('\n').trim();
+}
+
 function firstUrl(text) {
   const m = String(text || '').match(/https?:\/\/\S+/i);
   return m ? m[0].replace(/[)\]\s]+$/g, '') : '';
@@ -384,8 +425,10 @@ function pickTelegramFullText(alert, overrideText = '') {
   if (direct) return direct;
 
   const raw = alert && typeof alert.raw === 'object' ? alert.raw : {};
+  const nested = raw.observation?.raw || {};
   const rawText = String(
     raw.telegramText || raw.text || raw.message || raw.caption ||
+    nested.telegramText || nested.telegramReply || nested.text || nested.message || nested.caption ||
     alert.text || alert.message || alert.caption || ''
   ).trim();
 
@@ -398,6 +441,11 @@ function pickTelegramFullText(alert, overrideText = '') {
     rawText.includes('🏆 최저')
   )) {
     return rawText;
+  }
+
+  // collector 경로는 서버가 평균/최저/할인율 판단 후 풀 템플릿을 직접 만든다.
+  if (alert.source === 'collector_observe' || raw.observation) {
+    return formatCollectorFullTemplate(alert);
   }
 
   return '';
@@ -927,7 +975,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v032-full-template-silent-collector-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v033-collector-full-template-telegram-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
