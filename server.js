@@ -19,6 +19,10 @@ const OBS_BUCKET_MS = Number(process.env.OBS_BUCKET_MS || 60 * 60 * 1000); // �
 const ALERT_MIN_AVG_DROP_PCT = Number(process.env.ALERT_MIN_AVG_DROP_PCT || 20);
 const ALERT_REQUIRE_LOW_MATCH = String(process.env.ALERT_REQUIRE_LOW_MATCH || 'true').toLowerCase() !== 'false';
 const MIN_HISTORY_COUNT = Number(process.env.MIN_HISTORY_COUNT || 2);
+const COUPANG_PARTNERS_ACCESS_KEY = process.env.COUPANG_PARTNERS_ACCESS_KEY || process.env.CP_ACCESS_KEY || '';
+const COUPANG_PARTNERS_SECRET_KEY = process.env.COUPANG_PARTNERS_SECRET_KEY || process.env.CP_SECRET_KEY || '';
+const COUPANG_PARTNERS_SUB_ID = process.env.COUPANG_PARTNERS_SUB_ID || process.env.CP_SUB_ID || '';
+
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -391,6 +395,55 @@ ${alert.url || ''}`.trim();
   } catch (e) {
     return { sent: false, error: String(e.message || e) };
   }
+}
+
+
+
+function coupangSignedDate() {
+  const d = new Date();
+  const pad = (x) => String(x).padStart(2, '0');
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+}
+
+function isCoupangUrl(url) {
+  try {
+    const u = new URL(String(url || ''));
+    return /(^|\.)coupang\.com$/i.test(u.hostname) || /(^|\.)link\.coupang\.com$/i.test(u.hostname);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function createCoupangDeeplinkServer(originalUrl, requestedSubId = '') {
+  const accessKey = String(COUPANG_PARTNERS_ACCESS_KEY || '').trim();
+  const secretKey = String(COUPANG_PARTNERS_SECRET_KEY || '').trim();
+  const requested = String(requestedSubId || '').trim();
+  const safeRequested = /^[A-Za-z0-9._-]{1,64}$/.test(requested) ? requested : '';
+  const subId = safeRequested || String(COUPANG_PARTNERS_SUB_ID || '').trim();
+  const url = String(originalUrl || '').trim();
+  if (!url) throw new Error('EMPTY_URL');
+  if (!isCoupangUrl(url)) throw new Error('NOT_COUPANG_URL');
+  if (!accessKey || !secretKey || !subId) return { ok: false, skipped: true, error: 'COUPANG_PARTNERS_ENV_MISSING' };
+
+  const apiPath = '/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink';
+  const query = `_E_=${encodeURIComponent(subId)}`;
+  const signedDate = coupangSignedDate();
+  const message = signedDate + 'POST' + apiPath + query;
+  const signature = crypto.createHmac('sha256', secretKey).update(message).digest('hex');
+  const authorization = `CEA algorithm=HmacSHA256, access-key=${accessKey}, signed-date=${signedDate}, signature=${signature}`;
+
+  const r = await fetch(`https://api-gateway.coupang.com${apiPath}?${query}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: authorization },
+    body: JSON.stringify({ coupangUrls: [url] })
+  });
+  const data = await r.json().catch(() => null);
+  if (!r.ok || !data) throw new Error(`DEEPLINK_HTTP_${r.status}`);
+  if ((data.rCode === '0' || data.rCode === '0000') && Array.isArray(data.data) && data.data.length) {
+    const item = data.data[0] || {};
+    return { ok: true, partnerUrl: item.shortenUrl || item.landingUrl || '', shortenUrl: item.shortenUrl || '', landingUrl: item.landingUrl || '', raw: data };
+  }
+  throw new Error(data.message || data.rMessage || 'DEEPLINK_API_ERROR');
 }
 
 async function initDb() {
@@ -775,7 +828,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v027-unified-central-backfill-10d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v029-partner-subid-proxy-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -792,6 +845,21 @@ app.get('/debug/latest', async (req, res) => {
   }
 });
 
+
+
+
+// 배포용 확장프로그램: 파트너스 키를 확장 안에 넣지 않고 서버 환경변수로 딥링크 생성
+app.post('/partners/deeplink', async (req, res) => {
+  try {
+    const url = req.body?.url || req.body?.originalUrl || req.body?.coupangUrl || '';
+    const requestedSubId = req.body?.subId || req.body?.cpSubId || req.body?.partnerSubId || '';
+    const result = await createCoupangDeeplinkServer(url, requestedSubId);
+    if (!result.ok) return res.status(400).json(result);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 // 백필 전용: 기존 WowDrop SQLite DB의 최근 N일 가격기록을 서버 DB에 심는 용도.
 // 알림/푸시/텔레그램을 만들지 않고 price_observations에만 저장한다.
