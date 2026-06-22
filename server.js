@@ -715,22 +715,93 @@ async function insertObservation(obs, req) {
   return { inserted: r.rowCount > 0, observation: obs };
 }
 
+function uniqueStrings(list) {
+  const out = [];
+  const seen = new Set();
+  for (const x of list || []) {
+    const v = String(x || '').trim();
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+function productKeyLookupVariants(obs = {}) {
+  const productId = s(obs.productId, 80);
+  const itemId = s(obs.itemId, 80);
+  const vendorItemId = s(obs.vendorItemId, 80);
+
+  // v030: 백필/키위/PC가 productKey를 조금 다르게 만들 수 있어서 가능한 ID 조합을 같이 조회한다.
+  // 예: ID:productId|vendorItemId  vs  ID:productId|itemId|vendorItemId
+  return uniqueStrings([
+    obs.productKey,
+    productId && vendorItemId ? `ID:${productId}|${vendorItemId}` : '',
+    productId && itemId && vendorItemId ? `ID:${productId}|${itemId}|${vendorItemId}` : '',
+    productId && itemId ? `ID:${productId}|${itemId}` : '',
+    productId ? `ID:${productId}` : ''
+  ]);
+}
+
+function summarizeObservationPrices(items, cutoff) {
+  const prices = (items || []).map(o => n(o.price)).filter(x => x > 0);
+  const count = prices.length;
+  const avg = count ? Math.round(prices.reduce((a,b) => a + b, 0) / count) : 0;
+  const low = count ? Math.min(...prices) : 0;
+  const high = count ? Math.max(...prices) : 0;
+  return { count, avg, low, high, cutoff };
+}
+
 async function getObservationStats(obs) {
   const cutoff = now() - PRICE_RETENTION_MS;
+  const variants = productKeyLookupVariants(obs);
+
   if (!pool) {
-    const items = memory.observations.filter(o => o.productKey === obs.productKey && o.optionKey === obs.optionKey && n(o.collectedAt || o.createdAt) >= cutoff);
-    const prices = items.map(o => n(o.price)).filter(x => x > 0);
-    const count = prices.length;
-    const avg = count ? Math.round(prices.reduce((a,b) => a + b, 0) / count) : 0;
-    const low = count ? Math.min(...prices) : 0;
-    return { count, avg, low, cutoff };
+    let items = memory.observations.filter(o => variants.includes(o.productKey) && o.optionKey === obs.optionKey && n(o.collectedAt || o.createdAt) >= cutoff);
+
+    // v030 fallback: ID가 없거나 백필 키가 TXT 기반일 때 title_key + option_key로 한 번 더 찾는다.
+    if (!items.length && obs.titleKey) {
+      items = memory.observations.filter(o => o.titleKey === obs.titleKey && o.optionKey === obs.optionKey && n(o.collectedAt || o.createdAt) >= cutoff);
+    }
+
+    return { ...summarizeObservationPrices(items, cutoff), match: items.length ? 'memory' : 'none', productKeyVariants: variants };
   }
-  const { rows } = await pool.query(`SELECT COUNT(*)::int AS count, ROUND(AVG(price))::int AS avg, MIN(price)::int AS low
-    FROM price_observations
-    WHERE product_key=$1 AND option_key=$2 AND collected_at >= $3 AND price > 0`,
-    [obs.productKey, obs.optionKey, cutoff]);
-  const r = rows[0] || {};
-  return { count: n(r.count), avg: n(r.avg), low: n(r.low), cutoff };
+
+  async function queryByProductKeys(keys, optionKey) {
+    if (!keys.length) return { count: 0, avg: 0, low: 0, high: 0 };
+    const { rows } = await pool.query(`SELECT COUNT(*)::int AS count, ROUND(AVG(price))::int AS avg, MIN(price)::int AS low, MAX(price)::int AS high
+      FROM price_observations
+      WHERE product_key = ANY($1::text[]) AND option_key=$2 AND collected_at >= $3 AND price > 0`,
+      [keys, optionKey, cutoff]);
+    return rows[0] || {};
+  }
+
+  async function queryByTitleKey(titleKey, optionKey) {
+    if (!titleKey) return { count: 0, avg: 0, low: 0, high: 0 };
+    const { rows } = await pool.query(`SELECT COUNT(*)::int AS count, ROUND(AVG(price))::int AS avg, MIN(price)::int AS low, MAX(price)::int AS high
+      FROM price_observations
+      WHERE title_key=$1 AND option_key=$2 AND collected_at >= $3 AND price > 0`,
+      [titleKey, optionKey, cutoff]);
+    return rows[0] || {};
+  }
+
+  let r = await queryByProductKeys(variants, obs.optionKey);
+  let match = 'product_key';
+
+  if (n(r.count) <= 0 && obs.titleKey) {
+    r = await queryByTitleKey(obs.titleKey, obs.optionKey);
+    match = 'title_key';
+  }
+
+  return {
+    count: n(r.count),
+    avg: n(r.avg),
+    low: n(r.low),
+    high: n(r.high),
+    cutoff,
+    match: n(r.count) > 0 ? match : 'none',
+    productKeyVariants: variants
+  };
 }
 
 function shouldCreateAlertFromObservation(obs, stats) {
@@ -828,7 +899,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v029-partner-subid-proxy-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v030-stats-high-fallback-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
