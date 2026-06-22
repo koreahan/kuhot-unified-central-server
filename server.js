@@ -379,23 +379,51 @@ function parseTelegramText(text, body = {}) {
   });
 }
 
-async function sendTelegram(alert) {
+function pickTelegramFullText(alert, overrideText = '') {
+  const direct = String(overrideText || '').trim();
+  if (direct) return direct;
+
+  const raw = alert && typeof alert.raw === 'object' ? alert.raw : {};
+  const rawText = String(
+    raw.telegramText || raw.text || raw.message || raw.caption ||
+    alert.text || alert.message || alert.caption || ''
+  ).trim();
+
+  // 완성 템플릿이면 서버가 줄이지 않고 그대로 보낸다.
+  if (rawText && (
+    rawText.includes('최종 혜택가') ||
+    rawText.includes('상세보기 및 구매하기') ||
+    rawText.includes('파트너스활동') ||
+    rawText.includes('📉 평균') ||
+    rawText.includes('🏆 최저')
+  )) {
+    return rawText;
+  }
+
+  return '';
+}
+
+async function sendTelegram(alert, overrideText = '') {
   const token = process.env.TELEGRAM_BOT_TOKEN || '';
   const chatId = process.env.TELEGRAM_CHAT_ID || '';
   if (!token || !chatId) return { sent: false, skipped: true };
-  const text = `${pushCompactText(alert)}
-${alert.url || ''}`.trim();
+
+  const fullText = pickTelegramFullText(alert, overrideText);
+  const text = (fullText || `${pushCompactText(alert)}
+${alert.url || ''}`).trim();
+
   try {
     const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: false })
     });
-    return { sent: r.ok, status: r.status };
+    return { sent: r.ok, status: r.status, fullTemplate: !!fullText };
   } catch (e) {
     return { sent: false, error: String(e.message || e) };
   }
 }
+
 
 
 
@@ -899,7 +927,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v030-stats-high-fallback-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v032-full-template-silent-collector-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -982,7 +1010,10 @@ app.post('/collector/observe-batch', async (req, res) => {
         const obs = normalizeObservation(merged);
         const obsResult = await insertObservation(obs, req);
         const stats = await getObservationStats(obs);
-        const decision = shouldCreateAlertFromObservation(obs, stats);
+        const silentCollector = !!(merged?.muteAlert || merged?.noAlert || merged?.silent || merged?.noTelegram || merged?.collectorOnly || req.body?.common?.muteAlert || req.body?.common?.noTelegram);
+        const decision = silentCollector
+          ? { create: false, reason: 'collector_only_mute_alert' }
+          : shouldCreateAlertFromObservation(obs, stats);
         let alertResult = { created: false, duplicate: false, reason: decision.reason };
         let push = { sent: 0, skipped: true };
         let telegram = { sent: false, skipped: true };
@@ -1014,7 +1045,10 @@ app.post('/collector/observe', async (req, res) => {
     const obs = normalizeObservation(req.body || {});
     const obsResult = await insertObservation(obs, req);
     const stats = await getObservationStats(obs);
-    const decision = shouldCreateAlertFromObservation(obs, stats);
+    const silentCollector = !!(req.body?.muteAlert || req.body?.noAlert || req.body?.silent || req.body?.noTelegram || req.body?.collectorOnly);
+    const decision = silentCollector
+      ? { create: false, reason: 'collector_only_mute_alert' }
+      : shouldCreateAlertFromObservation(obs, stats);
     let alertResult = { created: false, duplicate: false, reason: decision.reason };
     let push = { sent: 0, skipped: true };
     let telegram = { sent: false, skipped: true };
@@ -1127,7 +1161,8 @@ app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
     const alert = text ? parseTelegramText(text, body) : normalizeAlert({ ...body, source: body.source || 'telegram_bridge' });
     const result = await insertAlert(alert);
     const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
-    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, alert, push });
+    const telegram = result.inserted ? await sendTelegram(alert, text) : { sent: false, duplicate: true };
+    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, alert, push, telegram });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
