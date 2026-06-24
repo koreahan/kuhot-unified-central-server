@@ -1267,6 +1267,74 @@ app.post('/push/test', async (req, res) => {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
+app.get('/collector/debug-source-counts', async (req, res) => {
+  try {
+    if (!pool) return res.json({ ok: false, error: 'NO_POSTGRES_POOL' });
+
+    const days = Math.min(Math.max(Number(req.query.days || 7), 1), 30);
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+    const { rows } = await pool.query(`
+      SELECT
+        source,
+        COUNT(*)::int AS count,
+        MIN(collected_at)::bigint AS first_collected_at,
+        MAX(collected_at)::bigint AS last_collected_at
+      FROM price_observations
+      WHERE collected_at >= $1
+      GROUP BY source
+      ORDER BY count DESC
+    `, [cutoff]);
+
+    res.json({ ok: true, days, cutoff, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.get('/collector/debug-groups', async (req, res) => {
+  try {
+    if (!pool) return res.json({ ok: false, error: 'NO_POSTGRES_POOL' });
+
+    const days = Math.min(Math.max(Number(req.query.days || 7), 1), 30);
+    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 300);
+    const q = String(req.query.q || req.query.title || '').trim();
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+    const params = [cutoff];
+    let where = `collected_at >= $1`;
+
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND title ILIKE $2`;
+    }
+
+    params.push(limit);
+    const limitParam = params.length;
+
+    const { rows } = await pool.query(`
+      SELECT
+        product_key AS "productKey",
+        title,
+        option_text AS "option",
+        option_key AS "optionKey",
+        COUNT(*)::int AS count,
+        ROUND(AVG(price))::int AS avg,
+        MIN(price)::int AS low,
+        MAX(price)::int AS high,
+        STRING_AGG(DISTINCT source, ', ') AS sources
+      FROM price_observations
+      WHERE ${where}
+      GROUP BY product_key, title, option_text, option_key
+      ORDER BY count DESC
+      LIMIT $${limitParam}
+    `, params);
+
+    res.json({ ok: true, days, limit, q, cutoff, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 app.use((req, res) => {
   res.status(404).json({
