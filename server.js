@@ -836,27 +836,159 @@ function summarizeObservationPrices(items, cutoff) {
   return { count, avg, low, high, cutoff };
 }
 
+
+function stripPriceNoiseForMatch(text) {
+  let t = s(text, 700);
+  if (!t) return '';
+  t = t
+    .replace(/(\d{1,3})\s*,\s*(\d{3})/g, '$1,$2')
+    .replace(/\s+/g, ' ')
+    .replace(/[（(][^）)]*(?:당|원)[^）)]*[）)]/gu, '')
+    .replace(/\s*\d{1,3}(?:,\d{3})+\s*원\s*\/\s*\d{1,3}(?:,\d{3})+\s*원.*$/u, '')
+    .replace(/\s*\d{1,3}(?:,\d{3})+\s*원.*$/u, '')
+    .replace(/\s*\d{4,}\s*원.*$/u, '')
+    .replace(/\s*\d{1,3}\s*%\s*$/u, '')
+    .replace(/\s*(?:할인|와우)\s*$/u, '')
+    .trim();
+  return t;
+}
+
+function looksOptionPartForMatch(part) {
+  const t = stripPriceNoiseForMatch(part).replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (/원|당|할인|쿠폰|카드|즉시|청구|적립|와우/u.test(t)) return false;
+  return /^(?:\d+(?:\.\d+)?\s*(?:kg|g|mg|l|L|ml|mL|cm|mm|GB|TB|gb|tb|개|개입|입|매|장|팩|봉|병|캔|롤|세트|회분|포|p|P|매입|통|박스|구|정|알|캡슐)|\d+\s*[xX×]\s*\d+|\d+개\s*입)$/u.test(t);
+}
+
+function cleanOptionPartForMatch(part) {
+  let t = stripPriceNoiseForMatch(part)
+    .replace(/(\d{1,3})\s*,\s*(\d{3})/g, '$1,$2')
+    .replace(/[()（）]/g, '')
+    .replace(/\s+/g, '')
+    .trim();
+  if (!t) return '';
+  if (/원|당|할인|쿠폰|카드|즉시|청구|적립|와우/u.test(t)) return '';
+  return t;
+}
+
+function splitLooseTitleOption(text) {
+  const cleaned = stripPriceNoiseForMatch(cleanTitleText(text || ''));
+  if (!cleaned) return { title: '', option: '' };
+  const parts = cleaned.split(/\s*,\s*/g).map(x => x.trim()).filter(Boolean);
+  if (parts.length <= 1) return { title: cleaned, option: '' };
+
+  const optionParts = [];
+  while (parts.length > 1 && looksOptionPartForMatch(parts[parts.length - 1])) {
+    optionParts.unshift(cleanOptionPartForMatch(parts.pop()));
+  }
+
+  return {
+    title: stripPriceNoiseForMatch(parts.join(', ')),
+    option: optionParts.filter(Boolean).join(', ')
+  };
+}
+
+function canonicalOptionMatchKey(option) {
+  const raw = String(option || '').trim();
+  if (!raw) return '';
+  const parts = raw
+    .replace(/\s*[·|/]\s*/g, ', ')
+    .split(/\s*,\s*/g)
+    .map(cleanOptionPartForMatch)
+    .filter(Boolean)
+    .map(normKey)
+    .filter(Boolean);
+  return uniqueStrings(parts).sort().join('');
+}
+
+function looseIdentityFromParts(title, option) {
+  const t = splitLooseTitleOption(title || '');
+  const opt = [t.option, option || ''].filter(Boolean).join(', ');
+  const baseTitle = stripPriceNoiseForMatch(t.title || title || '');
+  return {
+    title: baseTitle,
+    titleKey: normKey(baseTitle),
+    optionMatchKey: canonicalOptionMatchKey(opt),
+    optionKey: normalizeOptionForKey(opt)
+  };
+}
+
+function looseIdentityFromRow(row = {}) {
+  return looseIdentityFromParts(row.title || '', row.option_text || row.option || '');
+}
+
+function summarizeRowsForStats(rows, cutoff, match, variants) {
+  const prices = (rows || []).map(r => n(r.price)).filter(x => x > 0);
+  const count = prices.length;
+  return {
+    count,
+    avg: count ? Math.round(prices.reduce((a, b) => a + b, 0) / count) : 0,
+    low: count ? Math.min(...prices) : 0,
+    high: count ? Math.max(...prices) : 0,
+    cutoff,
+    match,
+    productKeyVariants: variants
+  };
+}
+
 async function getObservationStats(obs) {
   const cutoff = now() - PRICE_RETENTION_MS;
   const variants = productKeyLookupVariants(obs);
+  const wanted = looseIdentityFromParts(obs.title, obs.option);
+  const wantedTitleKey = wanted.titleKey || obs.titleKey;
+  const wantedOptionMatchKey = wanted.optionMatchKey || canonicalOptionMatchKey(obs.option || obs.optionKey || '');
 
-  if (!pool) {
-    let items = memory.observations.filter(o => variants.includes(o.productKey) && o.optionKey === obs.optionKey && n(o.collectedAt || o.createdAt) >= cutoff);
-
-    // v030 fallback: ID가 없거나 백필 키가 TXT 기반일 때 title_key + option_key로 한 번 더 찾는다.
-    if (!items.length && obs.titleKey) {
-      items = memory.observations.filter(o => o.titleKey === obs.titleKey && o.optionKey === obs.optionKey && n(o.collectedAt || o.createdAt) >= cutoff);
-    }
-
-    return { ...summarizeObservationPrices(items, cutoff), match: items.length ? 'memory' : 'none', productKeyVariants: variants };
+  if (!wantedTitleKey && !wantedOptionMatchKey) {
+    return { count: 0, avg: 0, low: 0, high: 0, cutoff, match: 'none', productKeyVariants: variants };
   }
 
+  function rowMatches(row) {
+    const rowId = looseIdentityFromRow(row);
+    const productMatch = variants.includes(String(row.product_key || row.productKey || ''));
+    const titleMatch = wantedTitleKey && rowId.titleKey === wantedTitleKey;
+    const optionMatch = wantedOptionMatchKey
+      ? rowId.optionMatchKey === wantedOptionMatchKey
+      : !rowId.optionMatchKey;
+    return Boolean((productMatch || titleMatch) && optionMatch);
+  }
+
+  if (!pool) {
+    const items = memory.observations.filter(o => n(o.collectedAt || o.createdAt) >= cutoff && rowMatches({
+      product_key: o.productKey,
+      title: o.title,
+      option_text: o.option,
+      price: o.price
+    }));
+    return summarizeRowsForStats(items, cutoff, items.length ? 'smart_memory' : 'none', variants);
+  }
+
+  const params = [cutoff, variants, wantedTitleKey || ''];
+  let where = `collected_at >= $1 AND price > 0 AND (product_key = ANY($2::text[]) OR title_key = $3`;
+  if (wanted.title && wanted.title.length >= 2) {
+    params.push(`%${wanted.title}%`);
+    where += ` OR title ILIKE $4`;
+  }
+  where += `)`;
+
+  const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at, source
+    FROM price_observations
+    WHERE ${where}
+    ORDER BY collected_at DESC
+    LIMIT 5000`, params);
+
+  const matched = rows.filter(rowMatches);
+
+  if (matched.length) {
+    return summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants);
+  }
+
+  // 마지막 방어: 기존 정확매칭 방식. smart 매칭 실패 시에만 사용한다.
   async function queryByProductKeys(keys, optionKey) {
     if (!keys.length) return { count: 0, avg: 0, low: 0, high: 0 };
     const { rows } = await pool.query(`SELECT COUNT(*)::int AS count, ROUND(AVG(price))::int AS avg, MIN(price)::int AS low, MAX(price)::int AS high
       FROM price_observations
       WHERE product_key = ANY($1::text[]) AND option_key=$2 AND collected_at >= $3 AND price > 0`,
-      [keys, optionKey, cutoff]);
+      [keys, obs.optionKey, cutoff]);
     return rows[0] || {};
   }
 
@@ -983,7 +1115,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v033-collector-full-template-telegram-7d', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v035-smart-canonical-stats', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1152,6 +1284,70 @@ app.get('/collector/observations', async (req, res) => {
   }
 });
 
+
+// TEMP DEBUG: DB에 실제로 어떤 title/option/product_key로 쌓였는지 그룹별 확인
+// 사용 후 필요 없으면 제거 가능. COLLECTOR_KEY가 설정돼 있으면 x-collector-key 필요.
+app.get('/collector/debug-groups', async (req, res) => {
+  try {
+    if (!allowCollector(req, res)) return;
+    await pruneOldData();
+    if (!pool) return res.json({ ok: true, mode: 'memory', groups: [] });
+
+    const limit = Math.min(Math.max(n(req.query.limit || 80), 1), 300);
+    const days = Math.min(Math.max(n(req.query.days || Math.ceil(PRICE_RETENTION_MS / (24 * 60 * 60 * 1000))), 1), 30);
+    const cutoff = now() - days * 24 * 60 * 60 * 1000;
+
+    const rawTitle = s(req.query.title || req.query.q || '', 300);
+    const rawOption = s(req.query.option || '', 300);
+    const titleKey = normKey(cleanTitleText(rawTitle));
+    const optionKey = normalizeOptionForKey(rawOption);
+    const titleLike = rawTitle ? `%${rawTitle.replace(/[\\%_]/g, '\\$&')}%` : '';
+    const titleKeyLike = titleKey ? `%${titleKey}%` : '';
+
+    const where = ['collected_at >= $1', 'price > 0'];
+    const params = [cutoff];
+    let idx = params.length;
+
+    if (rawTitle || titleKey) {
+      where.push(`(title_key = $${++idx} OR title_key LIKE $${++idx} OR title ILIKE $${++idx})`);
+      params.push(titleKey, titleKeyLike, titleLike);
+    }
+    if (rawOption || optionKey) {
+      where.push(`option_key = $${++idx}`);
+      params.push(optionKey);
+    }
+
+    params.push(limit);
+    const limitParam = params.length;
+
+    const { rows } = await pool.query(`
+      SELECT
+        product_key AS "productKey",
+        title,
+        title_key AS "titleKey",
+        COALESCE(option_text, '') AS "option",
+        COALESCE(option_key, '') AS "optionKey",
+        COUNT(*)::int AS count,
+        ROUND(AVG(price))::int AS avg,
+        MIN(price)::int AS low,
+        MAX(price)::int AS high,
+        MIN(collected_at)::bigint AS "firstSeenAt",
+        MAX(collected_at)::bigint AS "lastSeenAt",
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT source), NULL) AS sources,
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT worker_id), NULL) AS workers
+      FROM price_observations
+      WHERE ${where.join(' AND ')}
+      GROUP BY product_key, title, title_key, option_text, option_key
+      ORDER BY count DESC, "lastSeenAt" DESC
+      LIMIT $${limitParam}
+    `, params);
+
+    res.json({ ok: true, days, cutoff, query: { title: rawTitle, titleKey, option: rawOption, optionKey }, count: rows.length, groups: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 app.get('/collector/workers', async (req, res) => {
   try {
     if (!pool) return res.json({ ok: true, workers: [] });
@@ -1265,74 +1461,6 @@ app.post('/push/test', async (req, res) => {
     res.json({ ok: true, alert, push });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
-  }
-});
-app.get('/collector/debug-source-counts', async (req, res) => {
-  try {
-    if (!pool) return res.json({ ok: false, error: 'NO_POSTGRES_POOL' });
-
-    const days = Math.min(Math.max(Number(req.query.days || 7), 1), 30);
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-
-    const { rows } = await pool.query(`
-      SELECT
-        source,
-        COUNT(*)::int AS count,
-        MIN(collected_at)::bigint AS first_collected_at,
-        MAX(collected_at)::bigint AS last_collected_at
-      FROM price_observations
-      WHERE collected_at >= $1
-      GROUP BY source
-      ORDER BY count DESC
-    `, [cutoff]);
-
-    res.json({ ok: true, days, cutoff, rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-app.get('/collector/debug-groups', async (req, res) => {
-  try {
-    if (!pool) return res.json({ ok: false, error: 'NO_POSTGRES_POOL' });
-
-    const days = Math.min(Math.max(Number(req.query.days || 7), 1), 30);
-    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 300);
-    const q = String(req.query.q || req.query.title || '').trim();
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-
-    const params = [cutoff];
-    let where = `collected_at >= $1`;
-
-    if (q) {
-      params.push(`%${q}%`);
-      where += ` AND title ILIKE $2`;
-    }
-
-    params.push(limit);
-    const limitParam = params.length;
-
-    const { rows } = await pool.query(`
-      SELECT
-        product_key AS "productKey",
-        title,
-        option_text AS "option",
-        option_key AS "optionKey",
-        COUNT(*)::int AS count,
-        ROUND(AVG(price))::int AS avg,
-        MIN(price)::int AS low,
-        MAX(price)::int AS high,
-        STRING_AGG(DISTINCT source, ', ') AS sources
-      FROM price_observations
-      WHERE ${where}
-      GROUP BY product_key, title, option_text, option_key
-      ORDER BY count DESC
-      LIMIT $${limitParam}
-    `, params);
-
-    res.json({ ok: true, days, limit, q, cutoff, rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
