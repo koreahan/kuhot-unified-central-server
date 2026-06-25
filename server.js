@@ -164,6 +164,17 @@ function observationBucket(ts = now()) {
   return Math.floor(n(ts) / OBS_BUCKET_MS);
 }
 
+
+function kstDayRangeMs(ts = now()) {
+  // 한국 기준 하루 저장 정책: 같은 상품/옵션은 KST 날짜 단위로 판단한다.
+  const DAY = 24 * 60 * 60 * 1000;
+  const KST = 9 * 60 * 60 * 1000;
+  const t = n(ts) || now();
+  const dayNo = Math.floor((t + KST) / DAY);
+  const start = dayNo * DAY - KST;
+  return { start, end: start + DAY, dayNo };
+}
+
 function observationDedupeKey(obs) {
   // 파트너스 링크/원본 링크는 절대 중복 기준에 넣지 않는다.
   return crypto.createHash('sha1').update(`${obs.productKey}|${obs.optionKey}|${n(obs.price)}|${observationBucket(obs.collectedAt)}`).digest('hex');
@@ -803,19 +814,25 @@ async function touchWorker(obs, req) {
 async function insertObservation(obs, req) {
   await pruneOldData();
   await touchWorker(obs, req);
+
+  const saveDecision = await shouldStoreObservationDailyLow(obs);
+  if (!saveDecision.store) {
+    return { inserted: false, observation: obs, saveDecision };
+  }
+
   if (!pool) {
     const exists = memory.observations.find(x => x.obsKey === obs.obsKey);
-    if (exists) return { inserted: false, observation: exists };
+    if (exists) return { inserted: false, observation: exists, saveDecision: { ...saveDecision, reason: 'OBS_KEY_DUPLICATE_MEMORY' } };
     memory.observations.unshift(obs);
     memory.observations = memory.observations.slice(0, 200000);
-    return { inserted: true, observation: obs };
+    return { inserted: true, observation: obs, saveDecision };
   }
   const r = await pool.query(`INSERT INTO price_observations (
     id,obs_key,product_key,title,title_key,option_text,option_key,price,card_discount_pct,card_text,url,partner_url,product_id,item_id,vendor_item_id,category,worker_id,source,raw,collected_at,created_at
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
   ON CONFLICT (obs_key) DO NOTHING RETURNING id`,
   [obs.id, obs.obsKey, obs.productKey, obs.title, obs.titleKey, obs.option, obs.optionKey, obs.price, obs.cardDiscountPct, obs.cardText, obs.url, obs.partnerUrl, obs.productId, obs.itemId, obs.vendorItemId, obs.category, obs.workerId, obs.source, JSON.stringify(obs.raw), obs.collectedAt, obs.createdAt]);
-  return { inserted: r.rowCount > 0, observation: obs };
+  return { inserted: r.rowCount > 0, observation: obs, saveDecision: r.rowCount > 0 ? saveDecision : { ...saveDecision, reason: 'OBS_KEY_DUPLICATE_DB' } };
 }
 
 function uniqueStrings(list) {
@@ -948,6 +965,69 @@ function summarizeRowsForStats(rows, cutoff, match, variants) {
     match,
     productKeyVariants: variants
   };
+}
+
+
+async function shouldStoreObservationDailyLow(obs) {
+  // 저장 정책:
+  // 1) 같은 상품/옵션은 KST 기준 하루 첫 관측만 저장
+  // 2) 같은 날이라도 기존 당일 최저가보다 더 낮아지면 추가 저장
+  // 3) 같거나 높은 가격은 저장하지 않음
+  const price = n(obs.price);
+  const range = kstDayRangeMs(obs.collectedAt || obs.createdAt || now());
+  const variants = productKeyLookupVariants(obs);
+  const wanted = looseIdentityFromParts(obs.title, obs.option);
+  const wantedTitleKey = wanted.titleKey || obs.titleKey;
+  const wantedOptionMatchKey = wanted.optionMatchKey || canonicalOptionMatchKey(obs.option || obs.optionKey || '');
+
+  function rowMatches(row) {
+    const rowId = looseIdentityFromRow(row);
+    const productMatch = variants.includes(String(row.product_key || row.productKey || ''));
+    const titleMatch = wantedTitleKey && rowId.titleKey === wantedTitleKey;
+    const optionMatch = wantedOptionMatchKey
+      ? rowId.optionMatchKey === wantedOptionMatchKey
+      : !rowId.optionMatchKey;
+    return Boolean((productMatch || titleMatch) && optionMatch);
+  }
+
+  if (!price || price <= 0) {
+    return { store: false, reason: 'INVALID_PRICE', dayStart: range.start, dayEnd: range.end, todayCount: 0, todayLow: 0 };
+  }
+
+  if (!pool) {
+    const rows = memory.observations.filter(o =>
+      n(o.collectedAt || o.createdAt) >= range.start &&
+      n(o.collectedAt || o.createdAt) < range.end &&
+      n(o.price) > 0 &&
+      rowMatches({ product_key: o.productKey, title: o.title, option_text: o.option, price: o.price })
+    );
+    const prices = rows.map(o => n(o.price)).filter(x => x > 0);
+    const todayLow = prices.length ? Math.min(...prices) : 0;
+    if (!prices.length) return { store: true, reason: 'DAILY_FIRST_OBSERVATION', dayStart: range.start, dayEnd: range.end, todayCount: 0, todayLow: 0 };
+    if (price < todayLow) return { store: true, reason: 'DAILY_NEW_LOW', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
+    return { store: false, reason: 'DAILY_ALREADY_SEEN_NOT_LOWER', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
+  }
+
+  const params = [range.start, range.end, variants, wantedTitleKey || ''];
+  let where = `collected_at >= $1 AND collected_at < $2 AND price > 0 AND (product_key = ANY($3::text[]) OR title_key = $4`;
+  if (wanted.title && wanted.title.length >= 2) {
+    params.push(`%${wanted.title}%`);
+    where += ` OR title ILIKE $5`;
+  }
+  where += `)`;
+
+  const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at, source
+    FROM price_observations
+    WHERE ${where}
+    ORDER BY collected_at DESC
+    LIMIT 5000`, params);
+
+  const matched = rows.filter(rowMatches);
+  const prices = matched.map(r => n(r.price)).filter(x => x > 0);
+  const todayLow = prices.length ? Math.min(...prices) : 0;
+  if (!prices.length) return { store: true, reason: 'DAILY_FIRST_OBSERVATION', dayStart: range.start, dayEnd: range.end, todayCount: 0, todayLow: 0 };
+  if (price < todayLow) return { store: true, reason: 'DAILY_NEW_LOW', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
+  return { store: false, reason: 'DAILY_ALREADY_SEEN_NOT_LOWER', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
 }
 
 async function getObservationStats(obs) {
@@ -1134,7 +1214,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v038-badge-option-canonical', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v039-daily-low-save-canonical', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1188,7 +1268,7 @@ app.post('/collector/backfill-batch', async (req, res) => {
         const obsResult = await insertObservation(obs, req);
         if (obsResult.inserted) inserted += 1;
         else skipped += 1;
-        results.push({ ok: true, inserted: obsResult.inserted, title: obs.title, option: obs.option, price: obs.price, collectedAt: obs.collectedAt });
+        results.push({ ok: true, inserted: obsResult.inserted, saveDecision: obsResult.saveDecision, title: obs.title, option: obs.option, price: obs.price, collectedAt: obs.collectedAt });
       } catch (e) {
         failed += 1;
         results.push({ ok: false, error: String(e.message || e), raw: item });
@@ -1235,7 +1315,7 @@ app.post('/collector/observe-batch', async (req, res) => {
             pushed += n(push.sent);
           }
         }
-        results.push({ ok: true, observationInserted: obsResult.inserted, title: obs.title, option: obs.option, price: obs.price, stats, decision, alert: alertResult, push, telegram });
+        results.push({ ok: true, observationInserted: obsResult.inserted, saveDecision: obsResult.saveDecision, title: obs.title, option: obs.option, price: obs.price, stats, decision, alert: alertResult, push, telegram });
       } catch (e) {
         results.push({ ok: false, error: String(e.message || e), raw: item });
       }
@@ -1268,7 +1348,7 @@ app.post('/collector/observe', async (req, res) => {
         telegram = await sendTelegram(alert);
       }
     }
-    res.json({ ok: true, observationInserted: obsResult.inserted, observation: obs, stats, decision, alert: alertResult, push, telegram });
+    res.json({ ok: true, observationInserted: obsResult.inserted, saveDecision: obsResult.saveDecision, observation: obs, stats, decision, alert: alertResult, push, telegram });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
