@@ -113,8 +113,18 @@ function stripDisplayBadgesForCanonical(text) {
     .trim();
 }
 
+function stripCommerceSuffixesForCanonical(text) {
+  return s(text, 700)
+    // 쿠팡 목록/상세에서 옵션 뒤에 붙는 표시용 꼬리: "12개와우", "2개할인" 등
+    .replace(/\s*(?:와우\s*회원\s*전용|와우\s*전용|와우\s*회원|와우\s*할인|와우\s*쿠폰\s*할인|와우\s*쿠폰|와우)\s*$/giu, ' ')
+    .replace(/\s*(?:즉시\s*)?할인\s*$/giu, ' ')
+    .replace(/\s*(?:쿠폰\s*할인|쿠폰)\s*$/giu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function cleanTitleText(text) {
-  let t = stripDisplayBadgesForCanonical(stripDealPrefix(text));
+  let t = stripCommerceSuffixesForCanonical(stripDisplayBadgesForCanonical(stripDealPrefix(text)));
   // 상품명 끝에 붙는 가격 꼬리 제거.
   // 예: "도브 바디워시 (7,450원)", "도브 바디워시 (7,450?)"
   // 단순 용량(500g, 1kg)은 건드리지 않도록 콤마가 있는 금액 또는 "원" 포함 금액만 제거한다.
@@ -125,6 +135,9 @@ function cleanTitleText(text) {
     // 쿠팡 옵션 찌꺼기가 상품명 끝에 붙는 경우 정리: "상품명, FREE" / "상품명 FREE"
     .replace(/\s*,\s*(?:FREE|free|Free|프리)\s*$/u, '')
     .replace(/\s+(?:FREE|free|Free|프리)\s*$/u, '')
+    .replace(/\s*(?:와우\s*회원\s*전용|와우\s*전용|와우\s*회원|와우\s*할인|와우\s*쿠폰\s*할인|와우\s*쿠폰|와우)\s*$/giu, '')
+    .replace(/\s*(?:즉시\s*)?할인\s*$/giu, '')
+    .replace(/\s*(?:쿠폰\s*할인|쿠폰)\s*$/giu, '')
     .trim();
   return t || s(text, 300);
 }
@@ -217,7 +230,7 @@ function normalizeObservation(body = {}) {
 }
 
 function cleanOptionText(rawOption) {
-  const raw = s(rawOption, 300);
+  const raw = stripCommerceSuffixesForCanonical(s(rawOption, 300));
   if (!raw) return '';
   const parts = raw
     .replace(/\s*[·|/]\s*/g, ', ')
@@ -319,8 +332,8 @@ function formatCollectorFullTemplate(a) {
   const obsRaw = obs.raw || {};
   const stats = raw.stats || {};
   const decision = raw.decision || {};
-  const title = stripDisplayBadgesForCanonical(a.title || obs.title || '상품');
-  const option = s(a.option || obs.option || '', 300);
+  const title = cleanTitleText(a.title || obs.title || '상품');
+  const option = cleanOptionText(a.option || obs.option || '');
   const price = n(a.price || obs.price);
   const avg = n(a.avg || stats.avg);
   const low = n(a.low || stats.low);
@@ -470,7 +483,13 @@ function pickTelegramFullText(alert, overrideText = '') {
     alert.text || alert.message || alert.caption || ''
   ).trim();
 
-  // 완성 템플릿이면 서버가 줄이지 않고 그대로 보낸다.
+  // collector 경로는 클라이언트가 완성 템플릿을 같이 보내도 서버DB stats 기준으로 다시 만든다.
+  // 그렇지 않으면 에뮬/키위가 보낸 예전 평균가와 "12개와우" 같은 표시용 꼬리가 그대로 발송된다.
+  if (alert.source === 'collector_observe' || raw.observation) {
+    return formatCollectorFullTemplate(alert);
+  }
+
+  // collector가 아닌 레거시/수동 ingest에서 이미 완성된 템플릿을 보낸 경우만 그대로 보낸다.
   if (rawText && (
     rawText.includes('최종 혜택가') ||
     rawText.includes('상세보기 및 구매하기') ||
@@ -479,11 +498,6 @@ function pickTelegramFullText(alert, overrideText = '') {
     rawText.includes('🏆 최저')
   )) {
     return rawText;
-  }
-
-  // collector 경로는 서버가 평균/최저/할인율 판단 후 풀 템플릿을 직접 만든다.
-  if (alert.source === 'collector_observe' || raw.observation) {
-    return formatCollectorFullTemplate(alert);
   }
 
   return '';
@@ -968,6 +982,60 @@ function summarizeRowsForStats(rows, cutoff, match, variants) {
 }
 
 
+function rawNumberFromObservationRaw(raw, keys) {
+  const obj = raw && typeof raw === 'object' ? raw : {};
+  const nested = obj.raw && typeof obj.raw === 'object' ? obj.raw : {};
+  for (const k of keys || []) {
+    const v = n(obj[k]);
+    if (v > 0) return v;
+    const nv = n(nested[k]);
+    if (nv > 0) return nv;
+  }
+  return 0;
+}
+
+function summarizeEmulatorBaselineRowsForStats(rows, cutoff, variants, primaryStats = null) {
+  // 에뮬은 현재가 관측(price) 외에 로컬 WowDrop/폴센트 기준 avg/low를 raw.avg/raw.low로 같이 보낸다.
+  // 서버 price_observations 기준 이력이 부족할 때만 이 raw 기준값을 fallback으로 사용한다.
+  const candidates = [];
+  for (const row of rows || []) {
+    const raw = row && typeof row.raw === 'object' ? row.raw : {};
+    const avg = rawNumberFromObservationRaw(raw, ['avg', 'baselineAvg', 'avgPrice']);
+    const low = rawNumberFromObservationRaw(raw, ['low', 'baselineLow', 'lowPrice']);
+    const histN = rawNumberFromObservationRaw(raw, ['histN', 'historyCount', 'count']);
+    if (avg > 0 || low > 0) {
+      candidates.push({ row, avg, low, histN });
+    }
+  }
+  if (!candidates.length) return null;
+
+  // 최신 에뮬 baseline을 우선한다. 같은 상품/옵션이어도 오래된 baseline보다 최근 파서 판단이 낫다.
+  candidates.sort((a, b) => n(b.row.collected_at || b.row.collectedAt || b.row.created_at || b.row.createdAt) - n(a.row.collected_at || a.row.collectedAt || a.row.created_at || a.row.createdAt));
+  const picked = candidates[0];
+  const avg = n(picked.avg || 0);
+  const low = n(picked.low || 0);
+  const count = Math.max(n(picked.histN), MIN_HISTORY_COUNT, 2);
+  const high = Math.max(avg, low, n(picked.row.price));
+
+  return {
+    count,
+    avg,
+    low,
+    high,
+    cutoff,
+    match: 'emulator_raw_baseline_fallback',
+    fallback: true,
+    fallbackSource: s(picked.row.source || 'emulator_hotdeal_app', 80),
+    fallbackWorkerId: s(picked.row.worker_id || picked.row.workerId || '', 120),
+    fallbackCollectedAt: n(picked.row.collected_at || picked.row.collectedAt || 0),
+    primaryCount: primaryStats ? n(primaryStats.count) : 0,
+    primaryAvg: primaryStats ? n(primaryStats.avg) : 0,
+    primaryLow: primaryStats ? n(primaryStats.low) : 0,
+    productKeyVariants: variants
+  };
+}
+
+
 async function shouldStoreObservationDailyLow(obs) {
   // 저장 정책:
   // 1) 같은 상품/옵션은 KST 기준 하루 첫 관측만 저장
@@ -1077,8 +1145,23 @@ async function getObservationStats(obs) {
 
   const matched = rows.filter(rowMatches);
 
-  if (matched.length) {
-    return summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants);
+  const primaryStats = matched.length ? summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants) : null;
+  // 서버 price_observations 기준 이력이 충분하면 그것을 우선한다.
+  // 이 값이 PC/키위/백필/서버DB 실제 관측값이라 에뮬 raw baseline보다 신뢰도가 높다.
+  if (primaryStats && n(primaryStats.count) >= MIN_HISTORY_COUNT) {
+    return { ...primaryStats, sourcePriority: 'primary_server_observations' };
+  }
+
+  // 서버 이력이 없거나 현재가 1건뿐이면, 에뮬이 raw.avg/raw.low로 넘긴 로컬 이력값을 fallback으로 쓴다.
+  // 단, 이 fallback은 기존 서버 자료가 부족할 때만 쓴다.
+  const emulatorBaselineRows = matched.filter(r => String(r.source || '').includes('emulator_hotdeal_app'));
+  const emulatorFallbackStats = summarizeEmulatorBaselineRowsForStats(emulatorBaselineRows, cutoff, variants, primaryStats);
+  if (emulatorFallbackStats && (n(emulatorFallbackStats.avg) > 0 || n(emulatorFallbackStats.low) > 0)) {
+    return emulatorFallbackStats;
+  }
+
+  if (primaryStats) {
+    return { ...primaryStats, sourcePriority: 'primary_insufficient_no_emu_fallback' };
   }
 
   // 마지막 방어: 기존 정확매칭 방식. smart 매칭 실패 시에만 사용한다.
@@ -1214,7 +1297,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v039-daily-low-save-canonical', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v041-primary-stats-emu-baseline-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
