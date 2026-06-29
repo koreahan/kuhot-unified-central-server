@@ -103,28 +103,8 @@ function stripDealPrefix(text) {
   return t;
 }
 
-function stripDisplayBadgesForCanonical(text) {
-  return s(text, 700)
-    .replace(/\s*\[\s*로켓\s*프레시[^\]]*\]\s*/giu, ' ')
-    .replace(/\s*\[\s*로켓\s*직구[^\]]*\]\s*/giu, ' ')
-    .replace(/\s*\[\s*쿠팡\s*직구[^\]]*\]\s*/giu, ' ')
-    .replace(/\s*(?:로켓\s*프레시|로켓프레시|로켓\s*직구|로켓직구|쿠팡\s*직구|쿠팡직구)\s*$/giu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function stripCommerceSuffixesForCanonical(text) {
-  return s(text, 700)
-    // 쿠팡 목록/상세에서 옵션 뒤에 붙는 표시용 꼬리: "12개와우", "2개할인" 등
-    .replace(/\s*(?:와우\s*회원\s*전용|와우\s*전용|와우\s*회원|와우\s*할인|와우\s*쿠폰\s*할인|와우\s*쿠폰|와우)\s*$/giu, ' ')
-    .replace(/\s*(?:즉시\s*)?할인\s*$/giu, ' ')
-    .replace(/\s*(?:쿠폰\s*할인|쿠폰)\s*$/giu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 function cleanTitleText(text) {
-  let t = stripCommerceSuffixesForCanonical(stripDisplayBadgesForCanonical(stripDealPrefix(text)));
+  let t = stripDealPrefix(text);
   // 상품명 끝에 붙는 가격 꼬리 제거.
   // 예: "도브 바디워시 (7,450원)", "도브 바디워시 (7,450?)"
   // 단순 용량(500g, 1kg)은 건드리지 않도록 콤마가 있는 금액 또는 "원" 포함 금액만 제거한다.
@@ -135,9 +115,6 @@ function cleanTitleText(text) {
     // 쿠팡 옵션 찌꺼기가 상품명 끝에 붙는 경우 정리: "상품명, FREE" / "상품명 FREE"
     .replace(/\s*,\s*(?:FREE|free|Free|프리)\s*$/u, '')
     .replace(/\s+(?:FREE|free|Free|프리)\s*$/u, '')
-    .replace(/\s*(?:와우\s*회원\s*전용|와우\s*전용|와우\s*회원|와우\s*할인|와우\s*쿠폰\s*할인|와우\s*쿠폰|와우)\s*$/giu, '')
-    .replace(/\s*(?:즉시\s*)?할인\s*$/giu, '')
-    .replace(/\s*(?:쿠폰\s*할인|쿠폰)\s*$/giu, '')
     .trim();
   return t || s(text, 300);
 }
@@ -148,16 +125,7 @@ function normKey(text) {
 
 
 function normalizeOptionForKey(text) {
-  // 125ml, 24개 / 24개, 125ml 같은 옵션 순서 차이를 같은 키로 본다.
-  const cleaned = cleanOptionText(text || '');
-  const parts = String(cleaned || '')
-    .replace(/\s*[·|/]\s*/g, ', ')
-    .split(/\s*,\s*/g)
-    .map(x => x.trim())
-    .filter(Boolean)
-    .map(normKey)
-    .filter(Boolean);
-  return uniqueStrings(parts).sort().join('');
+  return normKey(cleanOptionText(text || ''));
 }
 
 function canonicalProductIdentity(a = {}) {
@@ -175,17 +143,6 @@ function canonicalProductIdentity(a = {}) {
 
 function observationBucket(ts = now()) {
   return Math.floor(n(ts) / OBS_BUCKET_MS);
-}
-
-
-function kstDayRangeMs(ts = now()) {
-  // 한국 기준 하루 저장 정책: 같은 상품/옵션은 KST 날짜 단위로 판단한다.
-  const DAY = 24 * 60 * 60 * 1000;
-  const KST = 9 * 60 * 60 * 1000;
-  const t = n(ts) || now();
-  const dayNo = Math.floor((t + KST) / DAY);
-  const start = dayNo * DAY - KST;
-  return { start, end: start + DAY, dayNo };
 }
 
 function observationDedupeKey(obs) {
@@ -230,7 +187,7 @@ function normalizeObservation(body = {}) {
 }
 
 function cleanOptionText(rawOption) {
-  const raw = stripCommerceSuffixesForCanonical(s(rawOption, 300));
+  const raw = s(rawOption, 300);
   if (!raw) return '';
   const parts = raw
     .replace(/\s*[·|/]\s*/g, ', ')
@@ -326,36 +283,71 @@ function formatPct1(v) {
   return Number.isInteger(x) ? String(x) : x.toFixed(1);
 }
 
+function parseRawJsonSafe(raw) {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(String(raw)); } catch (_) { return {}; }
+}
+
+function rawAppDiscountPct(raw) {
+  const r = parseRawJsonSafe(raw);
+  return Math.max(
+    0,
+    Math.abs(f(r.appDiscount || r.discount || 0)),
+    Math.abs(f(r.raw && (r.raw.appDiscount || r.raw.discount) || 0)),
+    Math.abs(f(r.observation && r.observation.raw && (r.observation.raw.appDiscount || r.observation.raw.discount) || 0))
+  );
+}
+
+function estimateAvgFromAppDiscount(price, pct) {
+  const p = n(price);
+  const d = Math.abs(f(pct));
+  if (p <= 0 || d <= 0 || d >= 95) return 0;
+  return Math.round(p / (1 - d / 100));
+}
+
+function dealGradeLine(dropPct, appPct = 0) {
+  const d = Math.max(Math.abs(f(dropPct)), Math.abs(f(appPct)));
+  if (d >= 45) return `🚨 초대박딜 · 🔻${formatPct1(d)}%`;
+  if (d >= 35) return `🔥 대박딜 · 🔻${formatPct1(d)}%`;
+  if (d >= 25) return `✨ 핫딜 · 🔻${formatPct1(d)}%`;
+  if (d >= 15) return `📉 가격하락 · 🔻${formatPct1(d)}%`;
+  return '';
+}
+
 function formatCollectorFullTemplate(a) {
   const raw = a.raw || {};
   const obs = raw.observation || {};
   const obsRaw = obs.raw || {};
   const stats = raw.stats || {};
   const decision = raw.decision || {};
-  const title = cleanTitleText(a.title || obs.title || '상품');
-  const option = cleanOptionText(a.option || obs.option || '');
+  const title = s(a.title || obs.title || '상품', 500);
+  const option = s(a.option || obs.option || '', 300);
   const price = n(a.price || obs.price);
   const avg = n(a.avg || stats.avg);
   const low = n(a.low || stats.low);
-  const avgDrop = f(a.dropPct || decision.avgDropPct || (avg > 0 && price > 0 ? ((avg - price) / avg) * 100 : 0));
+  const appFallbackPct = f(stats.appDiscountFallbackPct || obsRaw.appDiscount || obsRaw.raw?.appDiscount || a.appDiscount || 0);
+  const avgDrop = f(a.dropPct || decision.avgDropPct || (avg > 0 && price > 0 ? ((avg - price) / avg) * 100 : 0) || appFallbackPct);
   const lowDrop = f(decision.lowDropPct || (low > 0 && price > 0 ? ((low - price) / low) * 100 : 0));
   const avgDiff = avg > 0 && price > 0 ? Math.max(0, avg - price) : 0;
   const lowDiff = low > 0 && price > 0 ? Math.max(0, low - price) : 0;
-  const url = s(a.partnerUrl || obs.partnerUrl || a.url || obs.url || '', 1000);
+  const url = s(a.url || a.partnerUrl || obs.partnerUrl || obs.url || '', 1000);
   const hasFresh = !!(obsRaw.hasFresh || obsRaw.raw?.hasFresh);
   const hasJikgu = !!(obsRaw.hasJikgu || obsRaw.raw?.hasJikgu);
   const badge = hasFresh ? ' [로켓프레시❄️]' : (hasJikgu ? ' [로켓직구🌏]' : '');
   const label = isBigAlert(a) ? '🔥대박🔥 최종 혜택가 :' : '💰 최종 혜택가 :';
   const lines = [];
   lines.push('※ 파트너스활동으로 수수료를 제공받습니다.');
+  const gradeLine = dealGradeLine(avgDrop, appFallbackPct);
+  if (gradeLine) lines.push(gradeLine);
   lines.push(`✨ ${title}${badge}`);
   if (option) lines.push(`└ ${option}`);
   lines.push('');
   lines.push(`${label} ${won(price)}`);
   if (a.cardText) lines.push(`💳 카드할인 : ${a.cardText}`);
   lines.push('');
-  if (avg > 0 && avg !== low) lines.push(`📉 평균 ${won(avg)} · 🔻${formatPct1(avgDrop)}% (${won(avgDiff)})`);
-  if (low > 0) {
+  if (avg > 0) lines.push(`📉 평균 ${won(avg)} · 🔻${formatPct1(avgDrop)}% (${won(avgDiff)})`);
+  if (low > 0 && avg !== low) {
     if (price > 0 && Math.round(price) === Math.round(low)) {
       lines.push('🏆 기존 최저가와 동일');
     } else if (price > 0 && price < low) {
@@ -483,13 +475,7 @@ function pickTelegramFullText(alert, overrideText = '') {
     alert.text || alert.message || alert.caption || ''
   ).trim();
 
-  // collector 경로는 클라이언트가 완성 템플릿을 같이 보내도 서버DB stats 기준으로 다시 만든다.
-  // 그렇지 않으면 에뮬/키위가 보낸 예전 평균가와 "12개와우" 같은 표시용 꼬리가 그대로 발송된다.
-  if (alert.source === 'collector_observe' || raw.observation) {
-    return formatCollectorFullTemplate(alert);
-  }
-
-  // collector가 아닌 레거시/수동 ingest에서 이미 완성된 템플릿을 보낸 경우만 그대로 보낸다.
+  // 완성 템플릿이면 서버가 줄이지 않고 그대로 보낸다.
   if (rawText && (
     rawText.includes('최종 혜택가') ||
     rawText.includes('상세보기 및 구매하기') ||
@@ -498,6 +484,11 @@ function pickTelegramFullText(alert, overrideText = '') {
     rawText.includes('🏆 최저')
   )) {
     return rawText;
+  }
+
+  // collector 경로는 서버가 평균/최저/할인율 판단 후 풀 템플릿을 직접 만든다.
+  if (alert.source === 'collector_observe' || raw.observation) {
+    return formatCollectorFullTemplate(alert);
   }
 
   return '';
@@ -825,28 +816,107 @@ async function touchWorker(obs, req) {
     [workerId, s(obs.raw.workerName || obs.raw.name || workerId, 120), now(), s(obs.raw.appVersion || obs.raw.version || '', 80), s(req.ip || '', 80), JSON.stringify(obs.raw || {})]);
 }
 
+function kstDayRangeMs(ts = now()) {
+  const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+  const base = n(ts) || now();
+  const shifted = base + KST_OFFSET_MS;
+  const dayStartShifted = Math.floor(shifted / (24 * 60 * 60 * 1000)) * (24 * 60 * 60 * 1000);
+  const start = dayStartShifted - KST_OFFSET_MS;
+  return { start, end: start + 24 * 60 * 60 * 1000 };
+}
+
+function observationMatchesSameProductOption(obs, row = {}) {
+  const variants = productKeyLookupVariants(obs);
+  const wanted = looseIdentityFromParts(obs.title, obs.option);
+  const wantedTitleKey = wanted.titleKey || obs.titleKey;
+  const wantedOptionMatchKey = wanted.optionMatchKey || canonicalOptionMatchKey(obs.option || obs.optionKey || '');
+  const rowId = looseIdentityFromRow(row);
+  const productMatch = variants.includes(String(row.product_key || row.productKey || ''));
+  const titleMatch = wantedTitleKey && rowId.titleKey === wantedTitleKey;
+  const optionMatch = wantedOptionMatchKey
+    ? rowId.optionMatchKey === wantedOptionMatchKey
+    : !rowId.optionMatchKey;
+  return Boolean((productMatch || titleMatch) && optionMatch);
+}
+
+async function serverDailySavePolicy(obs) {
+  const price = n(obs.price);
+  if (price <= 0) return { allow: false, reason: 'INVALID_PRICE', dayPrices: [] };
+
+  const day = kstDayRangeMs(obs.collectedAt || obs.createdAt || now());
+  const variants = productKeyLookupVariants(obs);
+  const wanted = looseIdentityFromParts(obs.title, obs.option);
+  const wantedTitleKey = wanted.titleKey || obs.titleKey || '';
+
+  const sameProductRowsFromMemory = () => memory.observations.filter(o => {
+    const ts = n(o.collectedAt || o.createdAt);
+    if (ts < day.start || ts >= day.end || n(o.price) <= 0) return false;
+    return observationMatchesSameProductOption(obs, {
+      product_key: o.productKey,
+      title: o.title,
+      option_text: o.option,
+      option_key: o.optionKey,
+      price: o.price
+    });
+  });
+
+  let rows = [];
+  if (!pool) {
+    rows = sameProductRowsFromMemory();
+  } else {
+    const params = [day.start, day.end, variants, wantedTitleKey];
+    let where = `collected_at >= $1 AND collected_at < $2 AND price > 0 AND (product_key = ANY($3::text[]) OR title_key = $4`;
+    if (wanted.title && wanted.title.length >= 2) {
+      params.push(`%${wanted.title}%`);
+      where += ` OR title ILIKE $5`;
+    }
+    where += `)`;
+
+    const q = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at
+      FROM price_observations
+      WHERE ${where}
+      ORDER BY collected_at DESC
+      LIMIT 5000`, params);
+    rows = q.rows.filter(row => observationMatchesSameProductOption(obs, row));
+  }
+
+  const prices = rows.map(r => n(r.price)).filter(x => x > 0);
+  if (!prices.length) return { allow: true, reason: 'SAVE_FIRST_TODAY', dayPrices: [], dayStart: day.start, dayEnd: day.end };
+
+  if (prices.includes(price)) {
+    return { allow: false, reason: 'SKIP_SAME_PRICE_TODAY', dayPrices: prices, dayMin: Math.min(...prices), dayStart: day.start, dayEnd: day.end };
+  }
+
+  const dayMin = Math.min(...prices);
+  if (price < dayMin) {
+    return { allow: true, reason: 'SAVE_NEW_LOW_TODAY', dayPrices: prices, dayMin, dayStart: day.start, dayEnd: day.end };
+  }
+
+  return { allow: false, reason: 'SKIP_HIGHER_THAN_DAY_MIN', dayPrices: prices, dayMin, dayStart: day.start, dayEnd: day.end };
+}
+
 async function insertObservation(obs, req) {
   await pruneOldData();
   await touchWorker(obs, req);
 
-  const saveDecision = await shouldStoreObservationDailyLow(obs);
-  if (!saveDecision.store) {
-    return { inserted: false, observation: obs, saveDecision };
+  const policy = await serverDailySavePolicy(obs);
+  if (!policy.allow) {
+    return { inserted: false, observation: obs, skipped: true, reason: policy.reason, policy };
   }
 
   if (!pool) {
     const exists = memory.observations.find(x => x.obsKey === obs.obsKey);
-    if (exists) return { inserted: false, observation: exists, saveDecision: { ...saveDecision, reason: 'OBS_KEY_DUPLICATE_MEMORY' } };
+    if (exists) return { inserted: false, observation: exists, skipped: true, reason: 'OBS_KEY_DUPLICATE', policy };
     memory.observations.unshift(obs);
     memory.observations = memory.observations.slice(0, 200000);
-    return { inserted: true, observation: obs, saveDecision };
+    return { inserted: true, observation: obs, reason: policy.reason, policy };
   }
   const r = await pool.query(`INSERT INTO price_observations (
     id,obs_key,product_key,title,title_key,option_text,option_key,price,card_discount_pct,card_text,url,partner_url,product_id,item_id,vendor_item_id,category,worker_id,source,raw,collected_at,created_at
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
   ON CONFLICT (obs_key) DO NOTHING RETURNING id`,
   [obs.id, obs.obsKey, obs.productKey, obs.title, obs.titleKey, obs.option, obs.optionKey, obs.price, obs.cardDiscountPct, obs.cardText, obs.url, obs.partnerUrl, obs.productId, obs.itemId, obs.vendorItemId, obs.category, obs.workerId, obs.source, JSON.stringify(obs.raw), obs.collectedAt, obs.createdAt]);
-  return { inserted: r.rowCount > 0, observation: obs, saveDecision: r.rowCount > 0 ? saveDecision : { ...saveDecision, reason: 'OBS_KEY_DUPLICATE_DB' } };
+  return { inserted: r.rowCount > 0, observation: obs, skipped: r.rowCount <= 0, reason: r.rowCount > 0 ? policy.reason : 'OBS_KEY_DUPLICATE', policy };
 }
 
 function uniqueStrings(list) {
@@ -888,7 +958,7 @@ function summarizeObservationPrices(items, cutoff) {
 
 
 function stripPriceNoiseForMatch(text) {
-  let t = stripDisplayBadgesForCanonical(text);
+  let t = s(text, 700);
   if (!t) return '';
   t = t
     .replace(/(\d{1,3})\s*,\s*(\d{3})/g, '$1,$2')
@@ -906,7 +976,7 @@ function stripPriceNoiseForMatch(text) {
 function looksOptionPartForMatch(part) {
   const t = stripPriceNoiseForMatch(part).replace(/\s+/g, ' ').trim();
   if (!t) return false;
-  if (/원|당|할인|쿠폰|카드|즉시|청구|적립|와우|로켓프레시|로켓직구|쿠팡직구/u.test(t)) return false;
+  if (/원|당|할인|쿠폰|카드|즉시|청구|적립|와우/u.test(t)) return false;
   return /^(?:\d+(?:\.\d+)?\s*(?:kg|g|mg|l|L|ml|mL|cm|mm|GB|TB|gb|tb|개|개입|입|매|장|팩|봉|병|캔|롤|세트|회분|포|p|P|매입|통|박스|구|정|알|캡슐)|\d+\s*[xX×]\s*\d+|\d+개\s*입)$/u.test(t);
 }
 
@@ -917,7 +987,7 @@ function cleanOptionPartForMatch(part) {
     .replace(/\s+/g, '')
     .trim();
   if (!t) return '';
-  if (/원|당|할인|쿠폰|카드|즉시|청구|적립|와우|로켓프레시|로켓직구|쿠팡직구/u.test(t)) return '';
+  if (/원|당|할인|쿠폰|카드|즉시|청구|적립|와우/u.test(t)) return '';
   return t;
 }
 
@@ -967,135 +1037,46 @@ function looseIdentityFromRow(row = {}) {
   return looseIdentityFromParts(row.title || '', row.option_text || row.option || '');
 }
 
-function summarizeRowsForStats(rows, cutoff, match, variants) {
+function summarizeRowsForStats(rows, cutoff, match, variants, currentPrice = 0) {
   const prices = (rows || []).map(r => n(r.price)).filter(x => x > 0);
   const count = prices.length;
-  return {
+  const dbAvg = count ? Math.round(prices.reduce((a, b) => a + b, 0) / count) : 0;
+  const dbLow = count ? Math.min(...prices) : 0;
+  const dbHigh = count ? Math.max(...prices) : 0;
+
+  const appDiscountFallbackPct = Math.max(0, ...(rows || []).map(r => rawAppDiscountPct(r.raw)).filter(x => x > 0));
+  const appDiscountFallbackAvg = estimateAvgFromAppDiscount(currentPrice, appDiscountFallbackPct);
+  const dbDrop = dbAvg > 0 && currentPrice > 0 ? ((dbAvg - currentPrice) / dbAvg) * 100 : 0;
+  const dbMeaningful = count >= MIN_HISTORY_COUNT && dbAvg > currentPrice && dbDrop > 0.5;
+
+  const out = {
     count,
-    avg: count ? Math.round(prices.reduce((a, b) => a + b, 0) / count) : 0,
-    low: count ? Math.min(...prices) : 0,
-    high: count ? Math.max(...prices) : 0,
+    avg: dbAvg,
+    low: dbLow,
+    high: dbHigh,
+    dbAvg,
+    dbLow,
+    dbHigh,
+    appDiscountFallbackPct,
+    appDiscountFallbackAvg,
+    avgSource: 'server_db',
     cutoff,
     match,
     productKeyVariants: variants
   };
-}
 
-
-function rawNumberFromObservationRaw(raw, keys) {
-  const obj = raw && typeof raw === 'object' ? raw : {};
-  const nested = obj.raw && typeof obj.raw === 'object' ? obj.raw : {};
-  for (const k of keys || []) {
-    const v = n(obj[k]);
-    if (v > 0) return v;
-    const nv = n(nested[k]);
-    if (nv > 0) return nv;
-  }
-  return 0;
-}
-
-function summarizeEmulatorBaselineRowsForStats(rows, cutoff, variants, primaryStats = null) {
-  // 에뮬은 현재가 관측(price) 외에 로컬 WowDrop/폴센트 기준 avg/low를 raw.avg/raw.low로 같이 보낸다.
-  // 서버 price_observations 기준 이력이 부족할 때만 이 raw 기준값을 fallback으로 사용한다.
-  const candidates = [];
-  for (const row of rows || []) {
-    const raw = row && typeof row.raw === 'object' ? row.raw : {};
-    const avg = rawNumberFromObservationRaw(raw, ['avg', 'baselineAvg', 'avgPrice']);
-    const low = rawNumberFromObservationRaw(raw, ['low', 'baselineLow', 'lowPrice']);
-    const histN = rawNumberFromObservationRaw(raw, ['histN', 'historyCount', 'count']);
-    if (avg > 0 || low > 0) {
-      candidates.push({ row, avg, low, histN });
-    }
-  }
-  if (!candidates.length) return null;
-
-  // 최신 에뮬 baseline을 우선한다. 같은 상품/옵션이어도 오래된 baseline보다 최근 파서 판단이 낫다.
-  candidates.sort((a, b) => n(b.row.collected_at || b.row.collectedAt || b.row.created_at || b.row.createdAt) - n(a.row.collected_at || a.row.collectedAt || a.row.created_at || a.row.createdAt));
-  const picked = candidates[0];
-  const avg = n(picked.avg || 0);
-  const low = n(picked.low || 0);
-  const count = Math.max(n(picked.histN), MIN_HISTORY_COUNT, 2);
-  const high = Math.max(avg, low, n(picked.row.price));
-
-  return {
-    count,
-    avg,
-    low,
-    high,
-    cutoff,
-    match: 'emulator_raw_baseline_fallback',
-    fallback: true,
-    fallbackSource: s(picked.row.source || 'emulator_hotdeal_app', 80),
-    fallbackWorkerId: s(picked.row.worker_id || picked.row.workerId || '', 120),
-    fallbackCollectedAt: n(picked.row.collected_at || picked.row.collectedAt || 0),
-    primaryCount: primaryStats ? n(primaryStats.count) : 0,
-    primaryAvg: primaryStats ? n(primaryStats.avg) : 0,
-    primaryLow: primaryStats ? n(primaryStats.low) : 0,
-    productKeyVariants: variants
-  };
-}
-
-
-async function shouldStoreObservationDailyLow(obs) {
-  // 저장 정책:
-  // 1) 같은 상품/옵션은 KST 기준 하루 첫 관측만 저장
-  // 2) 같은 날이라도 기존 당일 최저가보다 더 낮아지면 추가 저장
-  // 3) 같거나 높은 가격은 저장하지 않음
-  const price = n(obs.price);
-  const range = kstDayRangeMs(obs.collectedAt || obs.createdAt || now());
-  const variants = productKeyLookupVariants(obs);
-  const wanted = looseIdentityFromParts(obs.title, obs.option);
-  const wantedTitleKey = wanted.titleKey || obs.titleKey;
-  const wantedOptionMatchKey = wanted.optionMatchKey || canonicalOptionMatchKey(obs.option || obs.optionKey || '');
-
-  function rowMatches(row) {
-    const rowId = looseIdentityFromRow(row);
-    const productMatch = variants.includes(String(row.product_key || row.productKey || ''));
-    const titleMatch = wantedTitleKey && rowId.titleKey === wantedTitleKey;
-    const optionMatch = wantedOptionMatchKey
-      ? rowId.optionMatchKey === wantedOptionMatchKey
-      : !rowId.optionMatchKey;
-    return Boolean((productMatch || titleMatch) && optionMatch);
+  // v038: 서버DB에 의미 있는 평균/최저 이력이 아직 없으면,
+  // 에뮬/키위/PC가 저장해 둔 앱 표시 할인율(raw.appDiscount)을 평균 기준가로 역산해서 표시한다.
+  // 첫 관측 1건만 있어서 avg == 현재가로 0.0%가 찍히는 케이스를 막는다.
+  if (!dbMeaningful && appDiscountFallbackAvg > currentPrice) {
+    out.avg = appDiscountFallbackAvg;
+    out.low = dbLow > currentPrice ? dbLow : 0;
+    out.high = Math.max(dbHigh, appDiscountFallbackAvg);
+    out.avgSource = 'app_discount_fallback';
+    out.match = `${match || 'none'}_app_discount_fallback`;
   }
 
-  if (!price || price <= 0) {
-    return { store: false, reason: 'INVALID_PRICE', dayStart: range.start, dayEnd: range.end, todayCount: 0, todayLow: 0 };
-  }
-
-  if (!pool) {
-    const rows = memory.observations.filter(o =>
-      n(o.collectedAt || o.createdAt) >= range.start &&
-      n(o.collectedAt || o.createdAt) < range.end &&
-      n(o.price) > 0 &&
-      rowMatches({ product_key: o.productKey, title: o.title, option_text: o.option, price: o.price })
-    );
-    const prices = rows.map(o => n(o.price)).filter(x => x > 0);
-    const todayLow = prices.length ? Math.min(...prices) : 0;
-    if (!prices.length) return { store: true, reason: 'DAILY_FIRST_OBSERVATION', dayStart: range.start, dayEnd: range.end, todayCount: 0, todayLow: 0 };
-    if (price < todayLow) return { store: true, reason: 'DAILY_NEW_LOW', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
-    return { store: false, reason: 'DAILY_ALREADY_SEEN_NOT_LOWER', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
-  }
-
-  const params = [range.start, range.end, variants, wantedTitleKey || ''];
-  let where = `collected_at >= $1 AND collected_at < $2 AND price > 0 AND (product_key = ANY($3::text[]) OR title_key = $4`;
-  if (wanted.title && wanted.title.length >= 2) {
-    params.push(`%${wanted.title}%`);
-    where += ` OR title ILIKE $5`;
-  }
-  where += `)`;
-
-  const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at, source
-    FROM price_observations
-    WHERE ${where}
-    ORDER BY collected_at DESC
-    LIMIT 5000`, params);
-
-  const matched = rows.filter(rowMatches);
-  const prices = matched.map(r => n(r.price)).filter(x => x > 0);
-  const todayLow = prices.length ? Math.min(...prices) : 0;
-  if (!prices.length) return { store: true, reason: 'DAILY_FIRST_OBSERVATION', dayStart: range.start, dayEnd: range.end, todayCount: 0, todayLow: 0 };
-  if (price < todayLow) return { store: true, reason: 'DAILY_NEW_LOW', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
-  return { store: false, reason: 'DAILY_ALREADY_SEEN_NOT_LOWER', dayStart: range.start, dayEnd: range.end, todayCount: prices.length, todayLow };
+  return out;
 }
 
 async function getObservationStats(obs) {
@@ -1124,9 +1105,10 @@ async function getObservationStats(obs) {
       product_key: o.productKey,
       title: o.title,
       option_text: o.option,
-      price: o.price
+      price: o.price,
+      raw: o.raw
     }));
-    return summarizeRowsForStats(items, cutoff, items.length ? 'smart_memory' : 'none', variants);
+    return summarizeRowsForStats(items, cutoff, items.length ? 'smart_memory' : 'none', variants, n(obs.price));
   }
 
   const params = [cutoff, variants, wantedTitleKey || ''];
@@ -1137,7 +1119,7 @@ async function getObservationStats(obs) {
   }
   where += `)`;
 
-  const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at, source
+  const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, price, collected_at, source, raw
     FROM price_observations
     WHERE ${where}
     ORDER BY collected_at DESC
@@ -1145,23 +1127,8 @@ async function getObservationStats(obs) {
 
   const matched = rows.filter(rowMatches);
 
-  const primaryStats = matched.length ? summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants) : null;
-  // 서버 price_observations 기준 이력이 충분하면 그것을 우선한다.
-  // 이 값이 PC/키위/백필/서버DB 실제 관측값이라 에뮬 raw baseline보다 신뢰도가 높다.
-  if (primaryStats && n(primaryStats.count) >= MIN_HISTORY_COUNT) {
-    return { ...primaryStats, sourcePriority: 'primary_server_observations' };
-  }
-
-  // 서버 이력이 없거나 현재가 1건뿐이면, 에뮬이 raw.avg/raw.low로 넘긴 로컬 이력값을 fallback으로 쓴다.
-  // 단, 이 fallback은 기존 서버 자료가 부족할 때만 쓴다.
-  const emulatorBaselineRows = matched.filter(r => String(r.source || '').includes('emulator_hotdeal_app'));
-  const emulatorFallbackStats = summarizeEmulatorBaselineRowsForStats(emulatorBaselineRows, cutoff, variants, primaryStats);
-  if (emulatorFallbackStats && (n(emulatorFallbackStats.avg) > 0 || n(emulatorFallbackStats.low) > 0)) {
-    return emulatorFallbackStats;
-  }
-
-  if (primaryStats) {
-    return { ...primaryStats, sourcePriority: 'primary_insufficient_no_emu_fallback' };
+  if (matched.length) {
+    return summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants, n(obs.price));
   }
 
   // 마지막 방어: 기존 정확매칭 방식. smart 매칭 실패 시에만 사용한다.
@@ -1224,7 +1191,9 @@ function shouldCreateAlertFromObservation(obs, stats) {
 }
 
 function alertFromObservation(obs, stats, decision) {
-  const section = decision.avgDropPct >= 30 || decision.lowDropPct >= 10 ? '대박' : '인기';
+  const appPct = rawAppDiscountPct(obs.raw);
+  const effectiveDrop = Math.max(f(decision.avgDropPct), f(decision.lowDropPct), appPct);
+  const section = effectiveDrop >= 35 ? '대박' : (effectiveDrop >= 25 ? '핫딜' : '인기');
   return normalizeAlert({
     id: id('alert'),
     dedupeKey: alertDedupeFromObservation(obs),
@@ -1236,7 +1205,7 @@ function alertFromObservation(obs, stats, decision) {
     avg: stats.avg,
     low: stats.low,
     dropPct: decision.avgDropPct,
-    appDiscount: 0,
+    appDiscount: appPct,
     cardText: obs.cardText,
     cardDiscountPct: obs.cardDiscountPct,
     partnerUrl: obs.partnerUrl || obs.url,
@@ -1297,7 +1266,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v041-primary-stats-emu-baseline-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v037-daily-low-save-policy', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1351,7 +1320,7 @@ app.post('/collector/backfill-batch', async (req, res) => {
         const obsResult = await insertObservation(obs, req);
         if (obsResult.inserted) inserted += 1;
         else skipped += 1;
-        results.push({ ok: true, inserted: obsResult.inserted, saveDecision: obsResult.saveDecision, title: obs.title, option: obs.option, price: obs.price, collectedAt: obs.collectedAt });
+        results.push({ ok: true, inserted: obsResult.inserted, reason: obsResult.reason || '', policy: obsResult.policy || null, title: obs.title, option: obs.option, price: obs.price, collectedAt: obs.collectedAt });
       } catch (e) {
         failed += 1;
         results.push({ ok: false, error: String(e.message || e), raw: item });
@@ -1398,7 +1367,7 @@ app.post('/collector/observe-batch', async (req, res) => {
             pushed += n(push.sent);
           }
         }
-        results.push({ ok: true, observationInserted: obsResult.inserted, saveDecision: obsResult.saveDecision, title: obs.title, option: obs.option, price: obs.price, stats, decision, alert: alertResult, push, telegram });
+        results.push({ ok: true, observationInserted: obsResult.inserted, observationReason: obsResult.reason || '', observationPolicy: obsResult.policy || null, title: obs.title, option: obs.option, price: obs.price, stats, decision, alert: alertResult, push, telegram });
       } catch (e) {
         results.push({ ok: false, error: String(e.message || e), raw: item });
       }
@@ -1431,7 +1400,7 @@ app.post('/collector/observe', async (req, res) => {
         telegram = await sendTelegram(alert);
       }
     }
-    res.json({ ok: true, observationInserted: obsResult.inserted, saveDecision: obsResult.saveDecision, observation: obs, stats, decision, alert: alertResult, push, telegram });
+    res.json({ ok: true, observationInserted: obsResult.inserted, observationReason: obsResult.reason || '', observationPolicy: obsResult.policy || null, observation: obs, stats, decision, alert: alertResult, push, telegram });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
