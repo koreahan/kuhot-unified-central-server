@@ -1147,12 +1147,17 @@ function summarizeRowsForStats(rows, cutoff, match, variants, currentPrice = 0) 
     productKeyVariants: variants
   };
 
-  // v038: 서버DB에 의미 있는 평균/최저 이력이 아직 없으면,
-  // 에뮬/키위/PC가 저장해 둔 앱 표시 할인율(raw.appDiscount)을 평균 기준가로 역산해서 표시한다.
-  // 첫 관측 1건만 있어서 avg == 현재가로 0.0%가 찍히는 케이스를 막는다.
+  // v044: 서버DB 이력이 충분하면 앱할인/에뮬 fallback이 평균가를 덮어쓰지 않는다.
+  // 사용자가 정한 우선순위: server_db >= emulator/raw fallback >= app_discount_fallback.
+  if (count >= MIN_HISTORY_COUNT) {
+    return out;
+  }
+
+  // 서버DB 이력이 부족할 때만 앱 표시 할인율(raw.appDiscount)을 평균 기준가로 역산한다.
+  // 단, 표시용 최저가는 DB에 있으면 그대로 유지한다. 알림/템플릿에서 현재가가 기존 최저보다 높으면 줄만 생략한다.
   if (!dbMeaningful && appDiscountFallbackAvg > currentPrice) {
     out.avg = appDiscountFallbackAvg;
-    out.low = dbLow > currentPrice ? dbLow : 0;
+    out.low = dbLow;
     out.high = Math.max(dbHigh, appDiscountFallbackAvg);
     out.avgSource = 'app_discount_fallback';
     out.match = `${match || 'none'}_app_discount_fallback`;
@@ -1260,10 +1265,11 @@ function shouldCreateAlertFromObservation(obs, stats) {
   const lowDropPct = low > 0 && price > 0 ? ((low - price) / low) * 100 : 0;
   const enoughHistory = count >= MIN_HISTORY_COUNT;
   const avgOk = avgDropPct >= ALERT_MIN_AVG_DROP_PCT;
-  const lowOk = !ALERT_REQUIRE_LOW_MATCH || low <= 0 || price <= low;
+  // v044: 알림은 평균 하락률 기준으로 생성한다. 기존 최저가보다 높으면 템플릿에서 최저가 줄만 생략한다.
+  const lowOk = true;
   return {
-    create: Boolean(enoughHistory && avgOk && lowOk),
-    reason: !enoughHistory ? 'NOT_ENOUGH_HISTORY' : (!avgOk ? 'AVG_DROP_TOO_LOW' : (!lowOk ? 'HIGHER_THAN_LOW' : 'OK')),
+    create: Boolean(enoughHistory && avgOk),
+    reason: !enoughHistory ? 'NOT_ENOUGH_HISTORY' : (!avgOk ? 'AVG_DROP_TOO_LOW' : 'OK'),
     avgDropPct,
     lowDropPct,
     count,
@@ -1348,7 +1354,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v042-unit-option-canonical-template-exact', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v044-alert-low-biglabel-restored', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1431,7 +1437,8 @@ app.post('/collector/observe-batch', async (req, res) => {
         const obs = normalizeObservation(merged);
         const obsResult = await insertObservation(obs, req);
         const stats = await getObservationStats(obs);
-        const silentCollector = !!(merged?.muteAlert || merged?.noAlert || merged?.silent || merged?.noTelegram || merged?.collectorOnly || req.body?.common?.muteAlert || req.body?.common?.noTelegram);
+        const forceAlert = !!(merged?.forceAlert || merged?.alertCandidate || req.body?.common?.forceAlert || req.body?.common?.alertCandidate) || String(merged?.source || '').startsWith('pc_collector_');
+        const silentCollector = !forceAlert && !!(merged?.muteAlert || merged?.noAlert || merged?.silent || merged?.noTelegram || merged?.collectorOnly || req.body?.common?.muteAlert || req.body?.common?.noTelegram);
         const decision = silentCollector
           ? { create: false, reason: 'collector_only_mute_alert' }
           : shouldCreateAlertFromObservation(obs, stats);
@@ -1466,7 +1473,8 @@ app.post('/collector/observe', async (req, res) => {
     const obs = normalizeObservation(req.body || {});
     const obsResult = await insertObservation(obs, req);
     const stats = await getObservationStats(obs);
-    const silentCollector = !!(req.body?.muteAlert || req.body?.noAlert || req.body?.silent || req.body?.noTelegram || req.body?.collectorOnly);
+    const forceAlert = !!(req.body?.forceAlert || req.body?.alertCandidate) || String(req.body?.source || '').startsWith('pc_collector_');
+    const silentCollector = !forceAlert && !!(req.body?.muteAlert || req.body?.noAlert || req.body?.silent || req.body?.noTelegram || req.body?.collectorOnly);
     const decision = silentCollector
       ? { create: false, reason: 'collector_only_mute_alert' }
       : shouldCreateAlertFromObservation(obs, stats);
