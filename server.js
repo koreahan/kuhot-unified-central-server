@@ -61,14 +61,19 @@ function stripDeliveryBadgeForKey(v = '') {
 function productKeyTextVariantsFromTitle(title = '') {
   const displayTitle = cleanTitleText(title || '');
   const strippedTitle = stripDeliveryBadgeForKey(displayTitle);
-  const strippedKey = normKey(strippedTitle);
-  const rawKey = normKey(displayTitle);
+  const loose = looseIdentityFromParts(strippedTitle, '');
+  const baseTitle = loose.title || strippedTitle;
+  const baseKey = normKey(baseTitle);
+  const rawKey = normKey(strippedTitle);
   return uniqueStrings([
-    strippedKey ? `TXT:${strippedKey}` : '',
+    baseKey ? `TXT:${baseKey}` : '',
     rawKey ? `TXT:${rawKey}` : '',
-    strippedKey ? `TXT:${strippedKey}로켓프레시` : '',
-    strippedKey ? `TXT:${strippedKey}로켓직구` : '',
-    strippedKey ? `TXT:${strippedKey}쿠팡직구` : '',
+    baseKey ? `TXT:${baseKey}로켓프레시` : '',
+    baseKey ? `TXT:${baseKey}로켓직구` : '',
+    baseKey ? `TXT:${baseKey}쿠팡직구` : '',
+    rawKey ? `TXT:${rawKey}로켓프레시` : '',
+    rawKey ? `TXT:${rawKey}로켓직구` : '',
+    rawKey ? `TXT:${rawKey}쿠팡직구` : '',
   ]);
 }
 
@@ -166,13 +171,15 @@ function canonicalProductIdentity(a = {}) {
   const vendorItemId = s(a.vendorItemId, 80);
   const idKey = [productId, itemId, vendorItemId].filter(Boolean).join('|');
 
-  // 표시용 title은 최대한 보존하되, DB 비교용 titleKey/productKey에서는 배송 배지를 제거한다.
-  const title = cleanTitleText(a.title || '');
-  const keyTitle = stripDeliveryBadgeForKey(title);
-  const titleKey = normKey(keyTitle);
-
-  // option 안에 로켓프레시/로켓직구가 섞여 들어와도 옵션키에서는 제거한다.
-  const option = cleanOptionText(stripDeliveryBadgeForKey(a.option || a.optionText || a.optionKey || ''));
+  // v042: PC 스크랩이 title에 "신라면 120g, 5개"처럼 옵션을 붙여 보내도
+  // 서버 저장/조회 키는 title="신라면", option="120g, 5개"로 정규화한다.
+  // 단, 로켓프레시/로켓직구 배지는 여전히 키에서만 제거한다.
+  const rawTitle = cleanTitleText(a.title || '');
+  const rawOption = cleanOptionText(stripDeliveryBadgeForKey(a.option || a.optionText || a.optionKey || ''));
+  const loose = looseIdentityFromParts(rawTitle, rawOption);
+  const title = loose.title || stripDeliveryBadgeForKey(rawTitle);
+  const titleKey = normKey(title);
+  const option = cleanOptionText(loose.option || rawOption || '');
   const optionKey = normalizeOptionForKey(option);
   const productKey = idKey ? `ID:${idKey}` : `TXT:${titleKey}`;
   return { productKey, title, titleKey, option, optionKey, productId, itemId, vendorItemId };
@@ -1038,19 +1045,46 @@ function cleanOptionPartForMatch(part) {
   return t;
 }
 
+function popEmbeddedTailOptionForMatch(titleText) {
+  const t = stripPriceNoiseForMatch(titleText || '').replace(/\s+/g, ' ').trim();
+  if (!t) return { title: '', option: '' };
+
+  // 예: "신라면 120g" -> title "신라면", option "120g"
+  // 예: "QCY 이어폰 블랙" 같은 색상/모델명은 여기서 건드리지 않는다.
+  const m = t.match(/^(.*?)(?:\s+)(\d+(?:\.\d+)?\s*(?:kg|g|mg|l|L|ml|mL|cm|mm|GB|TB|gb|tb|개|개입|입|매|장|팩|봉|병|캔|롤|세트|회분|포|p|P|매입|통|박스|구|정|알|캡슐))$/u);
+  if (!m) return { title: t, option: '' };
+
+  const base = stripPriceNoiseForMatch(m[1] || '').trim();
+  const opt = cleanOptionPartForMatch(m[2] || '');
+  if (!base || !opt) return { title: t, option: '' };
+  if (normKey(base).length < 2) return { title: t, option: '' };
+  return { title: base, option: opt };
+}
+
 function splitLooseTitleOption(text) {
   const cleaned = stripPriceNoiseForMatch(stripDeliveryBadgeForKey(cleanTitleText(text || '')));
   if (!cleaned) return { title: '', option: '' };
   const parts = cleaned.split(/\s*,\s*/g).map(x => x.trim()).filter(Boolean);
-  if (parts.length <= 1) return { title: cleaned, option: '' };
+
+  if (parts.length <= 1) {
+    const embedded = popEmbeddedTailOptionForMatch(cleaned);
+    return { title: embedded.title || cleaned, option: embedded.option || '' };
+  }
 
   const optionParts = [];
   while (parts.length > 1 && looksOptionPartForMatch(parts[parts.length - 1])) {
     optionParts.unshift(cleanOptionPartForMatch(parts.pop()));
   }
 
+  let title = stripPriceNoiseForMatch(parts.join(', '));
+  const embedded = popEmbeddedTailOptionForMatch(title);
+  if (embedded.option) {
+    title = embedded.title;
+    optionParts.unshift(embedded.option);
+  }
+
   return {
-    title: stripPriceNoiseForMatch(parts.join(', ')),
+    title: title || cleaned,
     option: optionParts.filter(Boolean).join(', ')
   };
 }
@@ -1070,11 +1104,12 @@ function canonicalOptionMatchKey(option) {
 
 function looseIdentityFromParts(title, option) {
   const t = splitLooseTitleOption(title || '');
-  const opt = [t.option, option || ''].filter(Boolean).join(', ');
+  const opt = cleanOptionText([t.option, option || ''].filter(Boolean).join(', '));
   const baseTitle = stripDeliveryBadgeForKey(stripPriceNoiseForMatch(t.title || title || ''));
   return {
     title: baseTitle,
     titleKey: normKey(baseTitle),
+    option: opt,
     optionMatchKey: canonicalOptionMatchKey(opt),
     optionKey: normalizeOptionForKey(opt)
   };
@@ -1313,7 +1348,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v041-bigdeal-price-label-template-exact', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v042-unit-option-canonical-template-exact', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
