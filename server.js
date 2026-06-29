@@ -379,7 +379,10 @@ function formatCollectorFullTemplate(a) {
   const hasFresh = !!(obsRaw.hasFresh || obsRaw.raw?.hasFresh);
   const hasJikgu = !!(obsRaw.hasJikgu || obsRaw.raw?.hasJikgu);
   const badge = hasFresh ? ' [로켓프레시❄️]' : (hasJikgu ? ' [로켓직구🌏]' : '');
-  const label = '💰 최종 혜택가 :';
+  const bigPriceLabelDrop = Math.max(Math.abs(f(avgDrop)), Math.abs(f(appFallbackPct)));
+  // v041: 가격하락/핫딜/대박딜 등급 문구는 제목 위에 출력하지 않지만,
+  // 대박 기준(1만원 이하 40% 이상, 그 외 35% 이상)을 넘으면 가격 라벨만 대박으로 표시한다.
+  const label = bigPriceLabelDrop >= bigDealThresholdForPrice(price) ? '🔥대박🔥 최종 혜택가 :' : '💰 최종 혜택가 :';
   const lines = [];
   lines.push('※ 파트너스활동으로 수수료를 제공받습니다.');
   lines.push(`✨ ${title}${badge}`);
@@ -1310,7 +1313,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v040-badge-display-only-template-exact', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v041-bigdeal-price-label-template-exact', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
