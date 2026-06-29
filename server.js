@@ -306,10 +306,16 @@ function estimateAvgFromAppDiscount(price, pct) {
   return Math.round(p / (1 - d / 100));
 }
 
-function dealGradeLine(dropPct, appPct = 0) {
+function bigDealThresholdForPrice(price = 0) {
+  const p = n(price);
+  return p > 0 && p <= 10000 ? 40 : 35;
+}
+
+function dealGradeLine(dropPct, appPct = 0, price = 0) {
   const d = Math.max(Math.abs(f(dropPct)), Math.abs(f(appPct)));
+  const bigNeed = bigDealThresholdForPrice(price);
   if (d >= 45) return `🚨 초대박딜 · 🔻${formatPct1(d)}%`;
-  if (d >= 35) return `🔥 대박딜 · 🔻${formatPct1(d)}%`;
+  if (d >= bigNeed) return `🔥 대박딜 · 🔻${formatPct1(d)}%`;
   if (d >= 25) return `✨ 핫딜 · 🔻${formatPct1(d)}%`;
   if (d >= 15) return `📉 가격하락 · 🔻${formatPct1(d)}%`;
   return '';
@@ -338,7 +344,7 @@ function formatCollectorFullTemplate(a) {
   const label = isBigAlert(a) ? '🔥대박🔥 최종 혜택가 :' : '💰 최종 혜택가 :';
   const lines = [];
   lines.push('※ 파트너스활동으로 수수료를 제공받습니다.');
-  const gradeLine = dealGradeLine(avgDrop, appFallbackPct);
+  const gradeLine = dealGradeLine(avgDrop, appFallbackPct, price);
   if (gradeLine) lines.push(gradeLine);
   lines.push(`✨ ${title}${badge}`);
   if (option) lines.push(`└ ${option}`);
@@ -1193,7 +1199,7 @@ function shouldCreateAlertFromObservation(obs, stats) {
 function alertFromObservation(obs, stats, decision) {
   const appPct = rawAppDiscountPct(obs.raw);
   const effectiveDrop = Math.max(f(decision.avgDropPct), f(decision.lowDropPct), appPct);
-  const section = effectiveDrop >= 35 ? '대박' : (effectiveDrop >= 25 ? '핫딜' : '인기');
+  const section = effectiveDrop >= bigDealThresholdForPrice(obs.price) ? '대박' : (effectiveDrop >= 25 ? '핫딜' : '인기');
   return normalizeAlert({
     id: id('alert'),
     dedupeKey: alertDedupeFromObservation(obs),
@@ -1266,7 +1272,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v037-daily-low-save-policy', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v039-bigdeal35-under10000-40', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
