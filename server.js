@@ -1656,7 +1656,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v050-prefer-emul-stats-over-app-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v051-ingest-always-stats-enrich', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1998,14 +1998,10 @@ app.get('/alerts/:id', async (req, res) => {
 });
 
 function isStatsEnrichableTelegramAlert(alert = {}) {
-  const src = String(alert.source || '').toLowerCase();
-  const raw = alert.raw || {};
-  return Boolean(
-    alert.title && n(alert.price) > 0 && (alert.url || alert.originalUrl) && (
-      src.includes('telegram') || src.includes('kiwi') || src.includes('manual') || src.includes('reply') ||
-      raw.telegramText || raw.text || raw.message || raw.caption
-    )
-  );
+  // v051: Coupangautobot/PC/키위 재전송이 source명을 telegram/kiwi/manual로 안 보내도
+  // title + price + url만 있으면 무조건 서버 stats/emul-stats 보강을 태운다.
+  // 이전 조건은 source 문자열에 의존해서 avg/low가 0인 채 그대로 발송되는 경로가 남았다.
+  return Boolean(alert.title && n(alert.price) > 0 && (alert.url || alert.originalUrl));
 }
 
 async function enrichTelegramAlertWithServerStats(alert, req) {
