@@ -162,7 +162,10 @@ function normKey(text) {
 
 
 function normalizeOptionForKey(text) {
-  return normKey(stripDeliveryBadgeForKey(cleanOptionText(text || '')));
+  const cleaned = stripDeliveryBadgeForKey(cleanOptionText(text || ''));
+  // v044: 옵션 순서가 달라도 같은 상품으로 묶는다.
+  // 예: "110g, 8개" == "8개, 110g" → optionKey=110g8개
+  return canonicalOptionMatchKey(cleaned) || normKey(cleaned);
 }
 
 function canonicalProductIdentity(a = {}) {
@@ -1089,17 +1092,40 @@ function splitLooseTitleOption(text) {
   };
 }
 
-function canonicalOptionMatchKey(option) {
+function optionPartSortRank(part) {
+  const k = normKey(part);
+  if (!k) return 90;
+  // 용량/중량/크기/저장용량은 앞쪽: 110g, 600ml, 400ml, 2kg ...
+  if (/^\d+(?:\.\d+)?(?:kg|g|mg|l|ml|ml|cm|mm|gb|tb)$/i.test(k)) return 10;
+  // 2x3, 2×3 같은 구성 표기는 용량 뒤, 색상/맛 앞
+  if (/^\d+[x×*]\d+$/i.test(k)) return 15;
+  // 색상/맛/호수 같은 텍스트 옵션은 수량보다 앞쪽
+  if (!/^\d/.test(k)) return 20;
+  if (/호$|번$/u.test(k)) return 20;
+  // 수량/개수는 뒤쪽: 8개, 20개, 6입, 15매 ...
+  if (/^\d+(?:개|개입|입|매|장|팩|봉|병|캔|롤|세트|회분|포|p|매입|통|박스|구|정|알|캡슐)$/iu.test(k)) return 30;
+  return 40;
+}
+
+function canonicalOptionPartsForMatch(option) {
   const raw = String(option || '').trim();
-  if (!raw) return '';
-  const parts = raw
-    .replace(/\s*[·|/]\s*/g, ', ')
-    .split(/\s*,\s*/g)
-    .map(cleanOptionPartForMatch)
-    .filter(Boolean)
-    .map(normKey)
-    .filter(Boolean);
-  return uniqueStrings(parts).sort().join('');
+  if (!raw) return [];
+  const seen = new Set();
+  const out = [];
+  for (const part of raw.replace(/\s*[·|/]\s*/g, ', ').split(/\s*,\s*/g)) {
+    const cleaned = cleanOptionPartForMatch(part);
+    if (!cleaned) continue;
+    const key = normKey(cleaned);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, rank: optionPartSortRank(cleaned) });
+  }
+  out.sort((a, b) => (a.rank - b.rank) || a.key.localeCompare(b.key, 'ko-KR'));
+  return out.map(x => x.key);
+}
+
+function canonicalOptionMatchKey(option) {
+  return canonicalOptionPartsForMatch(option).join('');
 }
 
 function looseIdentityFromParts(title, option) {
@@ -1415,7 +1441,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v043-client-fallback-stats-server-count-lte3', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v044-order-insensitive-option-key-client-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
