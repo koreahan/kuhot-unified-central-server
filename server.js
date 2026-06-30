@@ -1637,7 +1637,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v046-emul-stats-cache-order-option-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v047-telegram-ingest-stats-enrich', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1978,16 +1978,137 @@ app.get('/alerts/:id', async (req, res) => {
   }
 });
 
+function isStatsEnrichableTelegramAlert(alert = {}) {
+  const src = String(alert.source || '').toLowerCase();
+  const raw = alert.raw || {};
+  return Boolean(
+    alert.title && n(alert.price) > 0 && (alert.url || alert.originalUrl) && (
+      src.includes('telegram') || src.includes('kiwi') || src.includes('manual') || src.includes('reply') ||
+      raw.telegramText || raw.text || raw.message || raw.caption
+    )
+  );
+}
+
+async function enrichTelegramAlertWithServerStats(alert, req) {
+  // v047: kiwi_telegram_manual_reply / telegram ingest가 바로 alerts를 만들면
+  // 서버 DB·에뮬 통계 캐시를 타지 않아 평균/최저가 빠졌다.
+  // 여기서만 collector 관측 흐름과 같은 stats 조회를 태우고, 템플릿은 서버가 다시 렌더한다.
+  if (!isStatsEnrichableTelegramAlert(alert)) return { alert, enriched: false, obs: null, stats: null, decision: null, obsResult: null };
+
+  const obsInput = {
+    ...alert.raw,
+    source: alert.source || 'telegram_bridge',
+    title: alert.title,
+    option: alert.option,
+    price: alert.price,
+    avg: alert.avg,
+    low: alert.low,
+    dropPct: alert.dropPct,
+    appDiscount: alert.appDiscount,
+    cardText: alert.cardText,
+    cardDiscountPct: alert.cardDiscountPct,
+    url: alert.originalUrl || alert.url,
+    partnerUrl: alert.url || alert.originalUrl,
+    originalUrl: alert.originalUrl || alert.url,
+    productId: alert.productId,
+    itemId: alert.itemId,
+    vendorItemId: alert.vendorItemId,
+    workerId: alert.raw?.workerId || alert.raw?.collectorId || alert.source || 'telegram-ingest',
+    collectedAt: n(alert.createdAt) || now(),
+    noTelegram: true,
+    muteAlert: true,
+    rawTelegramIngest: true
+  };
+
+  const obs = normalizeObservation(obsInput);
+  let obsResult = { inserted: false, reason: 'not_attempted' };
+  try {
+    obsResult = await insertObservation(obs, req);
+  } catch (e) {
+    obsResult = { inserted: false, reason: 'insert_observation_failed', error: String(e.message || e) };
+  }
+
+  const serverStats = await getObservationStats(obs);
+  const textAvg = n(alert.avg);
+  const textLow = n(alert.low);
+  const textDrop = f(alert.dropPct || (textAvg > 0 && obs.price > 0 ? ((textAvg - obs.price) / textAvg) * 100 : 0));
+
+  const stats = {
+    ...serverStats,
+    count: Math.max(n(serverStats.count), textAvg > 0 ? MIN_HISTORY_COUNT : 0),
+    avg: n(serverStats.avg) > 0 ? n(serverStats.avg) : textAvg,
+    low: n(serverStats.low) > 0 ? n(serverStats.low) : textLow,
+    high: Math.max(n(serverStats.high), n(serverStats.avg), textAvg, textLow),
+    avgSource: n(serverStats.avg) > 0 ? serverStats.avgSource : (textAvg > 0 ? 'telegram_text_avg_line' : serverStats.avgSource),
+    match: n(serverStats.avg) > 0 ? serverStats.match : (textAvg > 0 ? `${serverStats.match || 'none'}_telegram_text_avg_line` : serverStats.match)
+  };
+
+  let decision = shouldCreateAlertFromObservation(obs, stats);
+  if (!decision.create && textAvg > 0 && textDrop >= ALERT_MIN_AVG_DROP_PCT) {
+    decision = {
+      ...decision,
+      create: true,
+      reason: 'OK_TELEGRAM_TEXT_AVG_LINE',
+      avgDropPct: textDrop,
+      lowDropPct: textLow > 0 && obs.price > 0 ? ((textLow - obs.price) / textLow) * 100 : 0,
+      count: stats.count,
+      avg: stats.avg,
+      low: stats.low
+    };
+  }
+
+  const appPct = rawAppDiscountPct(obs.raw);
+  const effectiveDrop = Math.max(f(decision.avgDropPct), f(decision.lowDropPct), f(alert.dropPct), appPct);
+  const section = effectiveDrop >= bigDealThresholdForPrice(obs.price) ? '대박' : (effectiveDrop >= 25 ? '핫딜' : (alert.section || '인기'));
+
+  const enriched = normalizeAlert({
+    ...alert,
+    source: alert.source || 'telegram_bridge',
+    section,
+    title: obs.title,
+    option: obs.option,
+    price: obs.price,
+    avg: stats.avg,
+    low: stats.low,
+    dropPct: f(decision.avgDropPct || alert.dropPct),
+    appDiscount: appPct || alert.appDiscount,
+    cardText: obs.cardText || alert.cardText,
+    cardDiscountPct: obs.cardDiscountPct || alert.cardDiscountPct,
+    partnerUrl: obs.partnerUrl || alert.url,
+    url: obs.partnerUrl || alert.url,
+    originalUrl: obs.url || alert.originalUrl || alert.url,
+    productId: obs.productId || alert.productId,
+    itemId: obs.itemId || alert.itemId,
+    vendorItemId: obs.vendorItemId || alert.vendorItemId
+  });
+
+  // 기존 PC/키위 수동 재요청 dedupeKey가 있으면 보존한다. 단, 없으면 기존 alert 기준 유지.
+  enriched.dedupeKey = alert.dedupeKey || enriched.dedupeKey;
+  enriched.raw = {
+    ...(alert.raw || {}),
+    observation: obs,
+    stats,
+    decision,
+    obsResult,
+    telegramIngestStatsEnriched: true,
+    originalAlert: alert
+  };
+  return { alert: enriched, enriched: true, obs, stats, decision, obsResult };
+}
+
 app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
   try {
     if (!allowIngest(req, res)) return;
     const body = req.body || {};
     const text = body.text || body.message || body.caption || '';
-    const alert = text ? parseTelegramText(text, body) : normalizeAlert({ ...body, source: body.source || 'telegram_bridge' });
+    const parsed = text ? parseTelegramText(text, body) : normalizeAlert({ ...body, source: body.source || 'telegram_bridge' });
+    const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
+    const alert = enriched.alert;
     const result = await insertAlert(alert);
     const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
-    const telegram = result.inserted ? await sendTelegram(alert, text) : { sent: false, duplicate: true };
-    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, alert, push, telegram });
+    // v047: 원문 overrideText를 넘기면 평균/최저 없는 원문이 그대로 재전송될 수 있어 넘기지 않는다.
+    const telegram = result.inserted ? await sendTelegram(alert) : { sent: false, duplicate: true };
+    res.json({ ok: true, bridge: 'telegram', inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, push, telegram });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
@@ -1996,11 +2117,13 @@ app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
 app.post('/ingest', async (req, res) => {
   try {
     if (!allowIngest(req, res)) return;
-    const alert = normalizeAlert(req.body || {});
+    const parsed = normalizeAlert(req.body || {});
+    const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
+    const alert = enriched.alert;
     const result = await insertAlert(alert);
     const push = result.inserted ? await sendPush(alert) : { sent: 0, duplicate: true };
     const telegram = result.inserted ? await sendTelegram(alert) : { sent: false, duplicate: true };
-    res.json({ ok: true, inserted: result.inserted, duplicate: !result.inserted, alert, push, telegram });
+    res.json({ ok: true, inserted: result.inserted, duplicate: !result.inserted, enriched: enriched.enriched, obsResult: enriched.obsResult, stats: enriched.stats, decision: enriched.decision, alert, push, telegram });
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
