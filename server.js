@@ -1417,10 +1417,27 @@ async function getEmulStatsCacheForObservation(obs, variants, wantedTitleKey, wa
 
 async function applyEmulServerStatsCache(out, obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff) {
   const serverCount = n(out.count);
-  if (serverCount > 3) return out;
+  const price = n(obs.price);
+  const serverAvg = n(out.avg);
+  const serverLow = n(out.low);
+  const serverDrop = serverAvg > 0 && price > 0 ? ((serverAvg - price) / serverAvg) * 100 : 0;
+  const avgSource = String(out.avgSource || '');
+
+  // v050: 기존 조건(serverCount <= 3) 때문에 app_discount_fallback 값이 4건 이상처럼 보이면
+  // 에뮬 통계 캐시가 있어도 무시되는 문제가 있었다.
+  // 서버 DB가 진짜 의미 있는 server_db 평균일 때만 유지하고,
+  // app_discount_fallback / low=0 / 현재가만 쌓인 DB / 약한 DB는 에뮬 조회값을 우선 사용한다.
+  const keepServerDb = Boolean(
+    avgSource === 'server_db' &&
+    serverCount > 3 &&
+    serverAvg > price &&
+    serverDrop > 0.5 &&
+    serverLow > 0
+  );
+  if (keepServerDb) return out;
+
   const emul = await getEmulStatsCacheForObservation(obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff);
   if (!emul || n(emul.count) <= 0 || n(emul.avg) <= 0) return out;
-  const price = n(obs.price);
   const emulAvg = n(emul.avg);
   const emulLow = n(emul.low);
   const emulHigh = n(emul.high);
@@ -1639,7 +1656,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v049-telegram-ingest-textavg-emulstats', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v050-prefer-emul-stats-over-app-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
