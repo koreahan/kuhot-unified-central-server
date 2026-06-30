@@ -1639,7 +1639,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v048-telegram-ingest-force-rerender', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v049-telegram-ingest-textavg-emulstats', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2035,14 +2035,23 @@ async function enrichTelegramAlertWithServerStats(alert, req) {
   const textLow = n(alert.low);
   const textDrop = f(alert.dropPct || (textAvg > 0 && obs.price > 0 ? ((textAvg - obs.price) / textAvg) * 100 : 0));
 
+  const serverAvg = n(serverStats.avg);
+  const serverCount = n(serverStats.count);
+  const textLooksUseful = textAvg > 0 && obs.price > 0 && textAvg > obs.price;
+  const serverLooksWeak = serverAvg <= 0 || serverAvg <= obs.price || serverCount <= 3;
+  const preferTextStats = Boolean(textLooksUseful && (serverLooksWeak || textAvg > serverAvg * 1.05));
+
+  const chosenAvg = preferTextStats ? textAvg : (serverAvg > 0 ? serverAvg : textAvg);
+  const chosenLow = preferTextStats ? (textLow > 0 ? textLow : n(serverStats.low)) : (n(serverStats.low) > 0 ? n(serverStats.low) : textLow);
+
   const stats = {
     ...serverStats,
-    count: Math.max(n(serverStats.count), textAvg > 0 ? MIN_HISTORY_COUNT : 0),
-    avg: n(serverStats.avg) > 0 ? n(serverStats.avg) : textAvg,
-    low: n(serverStats.low) > 0 ? n(serverStats.low) : textLow,
-    high: Math.max(n(serverStats.high), n(serverStats.avg), textAvg, textLow),
-    avgSource: n(serverStats.avg) > 0 ? serverStats.avgSource : (textAvg > 0 ? 'telegram_text_avg_line' : serverStats.avgSource),
-    match: n(serverStats.avg) > 0 ? serverStats.match : (textAvg > 0 ? `${serverStats.match || 'none'}_telegram_text_avg_line` : serverStats.match)
+    count: Math.max(serverCount, textAvg > 0 ? MIN_HISTORY_COUNT : 0),
+    avg: chosenAvg,
+    low: chosenLow,
+    high: Math.max(n(serverStats.high), serverAvg, textAvg, textLow),
+    avgSource: preferTextStats ? 'telegram_text_avg_line' : (serverAvg > 0 ? serverStats.avgSource : (textAvg > 0 ? 'telegram_text_avg_line' : serverStats.avgSource)),
+    match: preferTextStats ? `${serverStats.match || 'none'}_telegram_text_avg_line` : (serverAvg > 0 ? serverStats.match : (textAvg > 0 ? `${serverStats.match || 'none'}_telegram_text_avg_line` : serverStats.match))
   };
 
   let decision = shouldCreateAlertFromObservation(obs, stats);
@@ -2102,8 +2111,12 @@ app.post(['/telegram/ingest', '/telegram-ingest'], async (req, res) => {
   try {
     if (!allowIngest(req, res)) return;
     const body = req.body || {};
-    const text = body.text || body.message || body.caption || '';
-    const parsed = text ? parseTelegramText(text, body) : normalizeAlert({ ...body, source: body.source || 'telegram_bridge' });
+    const rawObj = (body && typeof body.raw === 'object') ? body.raw : {};
+    const text = body.text || body.message || body.caption ||
+      body.telegramText || body.telegramReply || body.originalText || body.rawText || body.fullText ||
+      body.sourceText || body.inputText || body.originalMessage || body.originalMessageText ||
+      rawObj.telegramText || rawObj.telegramReply || rawObj.originalText || rawObj.rawText || rawObj.fullText || '';
+    const parsed = text ? parseTelegramText(text, { ...body, text }) : normalizeAlert({ ...body, source: body.source || 'telegram_bridge' });
     const enriched = await enrichTelegramAlertWithServerStats(parsed, req);
     const alert = enriched.alert;
     const result = await insertAlert(alert);
