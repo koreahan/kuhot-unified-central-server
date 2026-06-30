@@ -28,7 +28,7 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
 let pool = null;
-const memory = { devices: new Map(), alerts: [], opens: [], observations: [] };
+const memory = { devices: new Map(), alerts: [], opens: [], observations: [], emulStats: [] };
 
 if (DATABASE_URL) {
   pool = new Pool({
@@ -692,6 +692,28 @@ async function initDb() {
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time ON price_observations(product_key, option_key, collected_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_created_at ON price_observations(created_at DESC)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS emul_price_stats (
+    id TEXT PRIMARY KEY,
+    stat_key TEXT UNIQUE NOT NULL,
+    product_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    title_key TEXT,
+    option_text TEXT,
+    option_key TEXT,
+    count INTEGER DEFAULT 0,
+    avg_price INTEGER DEFAULT 0,
+    low_price INTEGER DEFAULT 0,
+    high_price INTEGER DEFAULT 0,
+    source TEXT,
+    worker_id TEXT,
+    raw JSONB DEFAULT '{}'::jsonb,
+    first_seen_at BIGINT DEFAULT 0,
+    last_seen_at BIGINT DEFAULT 0,
+    updated_at BIGINT NOT NULL
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_product_option ON emul_price_stats(product_key, option_key, updated_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_title_option ON emul_price_stats(title_key, option_key, updated_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_last_seen ON emul_price_stats(last_seen_at DESC)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS collector_workers (
     worker_id TEXT PRIMARY KEY,
     name TEXT,
@@ -1250,6 +1272,170 @@ function summarizeRowsForStats(rows, cutoff, match, variants, currentPrice = 0) 
   return out;
 }
 
+function normalizeEmulStatsItem(body = {}) {
+  const optionRaw = body.option || body.optionText || body.optionKey || '';
+  const ids = canonicalProductIdentity({
+    title: body.title || '',
+    option: optionRaw,
+    productId: body.productId || '',
+    itemId: body.itemId || '',
+    vendorItemId: body.vendorItemId || ''
+  });
+  const count = n(body.count || body.n || body.historyCount || 0);
+  const avg = n(body.avg || body.ref || body.mean || body.avgPrice || 0);
+  const low = n(body.low || body.min || body.lowPrice || 0);
+  const high = n(body.high || body.max || body.highPrice || avg || 0);
+  const source = s(body.source || body.avgSource || 'emulator_server_stats_cache', 80);
+  const workerId = s(body.workerId || body.collectorId || 'emul-stats-sync', 120);
+  const firstSeenAt = n(body.firstSeenAt || body.first_seen_at || body.from || 0);
+  const lastSeenAt = n(body.lastSeenAt || body.last_seen_at || body.until || body.collectedAt || now());
+  const updatedAt = now();
+  if (!ids.title || !ids.optionKey || count <= 0 || avg <= 0) throw new Error('EMPTY_EMUL_STATS_REQUIRED_FIELD');
+  const statKey = crypto.createHash('sha1').update(`${ids.productKey}|${ids.optionKey}|${source}`).digest('hex');
+  return {
+    id: s(body.id) || `emulstat_${statKey}`,
+    statKey,
+    productKey: ids.productKey,
+    title: ids.title,
+    titleKey: ids.titleKey,
+    option: ids.option,
+    optionKey: ids.optionKey,
+    count,
+    avg,
+    low,
+    high,
+    source,
+    workerId,
+    firstSeenAt,
+    lastSeenAt,
+    updatedAt,
+    raw: body
+  };
+}
+
+async function upsertEmulStats(stat) {
+  if (!pool) {
+    const idx = memory.emulStats.findIndex(x => x.statKey === stat.statKey);
+    if (idx >= 0) memory.emulStats[idx] = stat;
+    else memory.emulStats.unshift(stat);
+    memory.emulStats = memory.emulStats.slice(0, 50000);
+    return { upserted: true, stat };
+  }
+  await pool.query(`INSERT INTO emul_price_stats (
+    id, stat_key, product_key, title, title_key, option_text, option_key, count, avg_price, low_price, high_price, source, worker_id, raw, first_seen_at, last_seen_at, updated_at
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+  ON CONFLICT (stat_key) DO UPDATE SET
+    product_key=$3,
+    title=$4,
+    title_key=$5,
+    option_text=$6,
+    option_key=$7,
+    count=$8,
+    avg_price=$9,
+    low_price=$10,
+    high_price=$11,
+    source=$12,
+    worker_id=$13,
+    raw=$14,
+    first_seen_at=$15,
+    last_seen_at=$16,
+    updated_at=$17`,
+    [stat.id, stat.statKey, stat.productKey, stat.title, stat.titleKey, stat.option, stat.optionKey, stat.count, stat.avg, stat.low, stat.high, stat.source, stat.workerId, JSON.stringify(stat.raw), stat.firstSeenAt, stat.lastSeenAt, stat.updatedAt]);
+  return { upserted: true, stat };
+}
+
+function summarizeEmulStatsRows(rows = [], cutoff = 0) {
+  const valid = (rows || []).map(r => ({
+    count: n(r.count || r.count_price || r.n || 0),
+    avg: n(r.avg_price || r.avg || 0),
+    low: n(r.low_price || r.low || 0),
+    high: n(r.high_price || r.high || 0),
+    source: s(r.source || 'emulator_server_stats_cache', 80),
+    lastSeenAt: n(r.last_seen_at || r.lastSeenAt || 0),
+  })).filter(x => x.count > 0 && x.avg > 0);
+  if (!valid.length) return null;
+  const total = valid.reduce((a, b) => a + b.count, 0);
+  const avg = total ? Math.round(valid.reduce((a, b) => a + b.avg * b.count, 0) / total) : 0;
+  const lows = valid.map(x => x.low).filter(x => x > 0);
+  const highs = valid.map(x => x.high).filter(x => x > 0);
+  return {
+    count: total,
+    avg,
+    low: lows.length ? Math.min(...lows) : 0,
+    high: highs.length ? Math.max(...highs, avg) : avg,
+    source: uniqueStrings(valid.map(x => x.source)).join('+') || 'emulator_server_stats_cache',
+    cutoff,
+    lastSeenAt: Math.max(...valid.map(x => x.lastSeenAt || 0))
+  };
+}
+
+async function getEmulStatsCacheForObservation(obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff) {
+  const wanted = looseIdentityFromParts(obs.title, obs.option);
+  function rowMatches(row) {
+    const rowId = looseIdentityFromRow(row);
+    const productMatch = variants.includes(String(row.product_key || row.productKey || ''));
+    const titleMatch = wantedTitleKey && rowId.titleKey === wantedTitleKey;
+    const optionMatch = wantedOptionMatchKey
+      ? rowId.optionMatchKey === wantedOptionMatchKey
+      : !rowId.optionMatchKey;
+    return Boolean((productMatch || titleMatch) && optionMatch);
+  }
+
+  if (!pool) {
+    const rows = memory.emulStats.filter(r => n(r.lastSeenAt || r.updatedAt) >= cutoff && rowMatches({
+      product_key: r.productKey,
+      title: r.title,
+      option_text: r.option,
+      option_key: r.optionKey,
+      count: r.count,
+      avg_price: r.avg,
+      low_price: r.low,
+      high_price: r.high,
+      source: r.source,
+      last_seen_at: r.lastSeenAt,
+    }));
+    return summarizeEmulStatsRows(rows, cutoff);
+  }
+
+  const params = [variants, wantedTitleKey || '', cutoff];
+  let where = `(product_key = ANY($1::text[]) OR title_key = $2`;
+  if (wanted.title && wanted.title.length >= 2) {
+    params.push(`%${wanted.title}%`);
+    where += ` OR title ILIKE $4`;
+  }
+  where += `) AND last_seen_at >= $3`;
+
+  const { rows } = await pool.query(`SELECT product_key, title, title_key, option_text, option_key, count, avg_price, low_price, high_price, source, worker_id, last_seen_at, updated_at
+    FROM emul_price_stats
+    WHERE ${where}
+    ORDER BY updated_at DESC
+    LIMIT 1000`, params);
+  return summarizeEmulStatsRows(rows.filter(rowMatches), cutoff);
+}
+
+async function applyEmulServerStatsCache(out, obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff) {
+  const serverCount = n(out.count);
+  if (serverCount > 3) return out;
+  const emul = await getEmulStatsCacheForObservation(obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff);
+  if (!emul || n(emul.count) <= 0 || n(emul.avg) <= 0) return out;
+  const price = n(obs.price);
+  const emulAvg = n(emul.avg);
+  const emulLow = n(emul.low);
+  const emulHigh = n(emul.high);
+  const drop = emulAvg > 0 && price > 0 ? ((emulAvg - price) / emulAvg) * 100 : 0;
+  if (price > 0 && emulAvg <= price && drop <= 0.5) return out;
+  return {
+    ...out,
+    count: n(emul.count),
+    avg: emulAvg,
+    low: emulLow,
+    high: Math.max(n(out.high), emulHigh, emulAvg),
+    emulStatsCache: emul,
+    avgSource: 'emulator_server_stats_cache',
+    match: `${out.match || 'none'}_emul_server_stats_cache`
+  };
+}
+
 async function getObservationStats(obs) {
   const cutoff = now() - PRICE_RETENTION_MS;
   const variants = productKeyLookupVariants(obs);
@@ -1279,7 +1465,11 @@ async function getObservationStats(obs) {
       price: o.price,
       raw: o.raw
     }));
-    return applyClientFallbackStats(summarizeRowsForStats(items, cutoff, items.length ? 'smart_memory' : 'none', variants, n(obs.price)), obs.raw, n(obs.price));
+    {
+      const baseStats = summarizeRowsForStats(items, cutoff, items.length ? 'smart_memory' : 'none', variants, n(obs.price));
+      const emulStats = await applyEmulServerStatsCache(baseStats, obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff);
+      return applyClientFallbackStats(emulStats, obs.raw, n(obs.price));
+    }
   }
 
   const params = [cutoff, variants, wantedTitleKey || ''];
@@ -1299,7 +1489,11 @@ async function getObservationStats(obs) {
   const matched = rows.filter(rowMatches);
 
   if (matched.length) {
-    return applyClientFallbackStats(summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants, n(obs.price)), obs.raw, n(obs.price));
+    {
+      const baseStats = summarizeRowsForStats(matched, cutoff, 'smart_canonical', variants, n(obs.price));
+      const emulStats = await applyEmulServerStatsCache(baseStats, obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff);
+      return applyClientFallbackStats(emulStats, obs.raw, n(obs.price));
+    }
   }
 
   // 마지막 방어: 기존 정확매칭 방식. smart 매칭 실패 시에만 사용한다.
@@ -1329,7 +1523,7 @@ async function getObservationStats(obs) {
     match = 'title_key';
   }
 
-  return applyClientFallbackStats({
+  const baseStats = {
     count: n(r.count),
     avg: n(r.avg),
     low: n(r.low),
@@ -1341,7 +1535,9 @@ async function getObservationStats(obs) {
     cutoff,
     match: n(r.count) > 0 ? match : 'none',
     productKeyVariants: variants
-  }, obs.raw, n(obs.price));
+  };
+  const emulStats = await applyEmulServerStatsCache(baseStats, obs, variants, wantedTitleKey, wantedOptionMatchKey, cutoff);
+  return applyClientFallbackStats(emulStats, obs.raw, n(obs.price));
 }
 
 function shouldCreateAlertFromObservation(obs, stats) {
@@ -1441,7 +1637,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v044-order-insensitive-option-key-client-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v046-emul-stats-cache-order-option-fallback', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -1508,6 +1704,57 @@ app.post('/collector/backfill-batch', async (req, res) => {
   }
 });
 
+
+
+// [서버] v046: 에뮬 로컬 DB 원본 행을 올리는 것이 아니라,
+// 에뮬 DB에서 조회/계산한 평균·최저 통계값만 서버 캐시에 올린다.
+// 이후 /collector/stats, /collector/observe는 서버 DB count <= 3이면 이 캐시를 fallback으로 사용한다.
+app.post('/collector/emul-stats-batch', async (req, res) => {
+  try {
+    if (!allowCollector(req, res)) return;
+    const items = Array.isArray(req.body?.items) ? req.body.items : (Array.isArray(req.body) ? req.body : []);
+    if (!items.length) return res.status(400).json({ ok: false, error: 'EMPTY_ITEMS' });
+    const common = req.body?.common && typeof req.body.common === 'object' ? req.body.common : {};
+    const results = [];
+    let upserted = 0;
+    let failed = 0;
+    for (const item of items.slice(0, 500)) {
+      try {
+        const merged = { ...common, ...item, source: item.source || common.source || 'emulator_server_stats_cache' };
+        const stat = normalizeEmulStatsItem(merged);
+        await upsertEmulStats(stat);
+        upserted += 1;
+        results.push({ ok: true, productKey: stat.productKey, optionKey: stat.optionKey, title: stat.title, option: stat.option, count: stat.count, avg: stat.avg, low: stat.low, high: stat.high, source: stat.source });
+      } catch (e) {
+        failed += 1;
+        results.push({ ok: false, error: String(e.message || e), raw: item });
+      }
+    }
+    res.json({ ok: true, mode: 'emul_stats_cache_only_no_raw_observations', count: results.length, upserted, failed, results });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.get('/collector/emul-stats', async (req, res) => {
+  try {
+    const obs = normalizeObservation({
+      title: req.query.title || req.query.q || '',
+      option: req.query.option || '',
+      price: req.query.price || 1,
+      productId: req.query.productId || '',
+      itemId: req.query.itemId || '',
+      vendorItemId: req.query.vendorItemId || ''
+    });
+    const cutoff = now() - PRICE_RETENTION_MS;
+    const variants = productKeyLookupVariants(obs);
+    const wanted = looseIdentityFromParts(obs.title, obs.option);
+    const stats = await getEmulStatsCacheForObservation(obs, variants, wanted.titleKey || obs.titleKey, wanted.optionMatchKey || canonicalOptionMatchKey(obs.option || obs.optionKey || ''), cutoff);
+    res.json({ ok: true, productKey: obs.productKey, optionKey: obs.optionKey, title: obs.title, option: obs.option, stats: stats || { count: 0, avg: 0, low: 0, high: 0, avgSource: 'emulator_server_stats_cache', match: 'none' } });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 
 app.post('/collector/observe-batch', async (req, res) => {
