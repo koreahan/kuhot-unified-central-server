@@ -524,13 +524,20 @@ function pickTelegramFullText(alert, overrideText = '') {
 
   const raw = alert && typeof alert.raw === 'object' ? alert.raw : {};
   const nested = raw.observation?.raw || {};
+
+  // v048: 텔레그램/키위 수동 재전송을 stats로 보강한 뒤에는 원문을 그대로 보내면 안 된다.
+  // 원문이 평균/최저 없는 템플릿이면 다시 평균 없이 나가므로, 보강된 alert 값으로 무조건 재렌더한다.
+  if (alert.source === 'collector_observe' || raw.observation || raw.telegramIngestStatsEnriched) {
+    return formatCollectorFullTemplate(alert);
+  }
+
   const rawText = String(
     raw.telegramText || raw.text || raw.message || raw.caption ||
     nested.telegramText || nested.telegramReply || nested.text || nested.message || nested.caption ||
     alert.text || alert.message || alert.caption || ''
   ).trim();
 
-  // 완성 템플릿이면 서버가 줄이지 않고 그대로 보낸다.
+  // 보강 대상이 아닌 완성 템플릿은 기존처럼 그대로 보낸다.
   if (rawText && (
     rawText.includes('최종 혜택가') ||
     rawText.includes('상세보기 및 구매하기') ||
@@ -539,11 +546,6 @@ function pickTelegramFullText(alert, overrideText = '') {
     rawText.includes('🏆 최저')
   )) {
     return rawText;
-  }
-
-  // collector 경로는 서버가 평균/최저/할인율 판단 후 풀 템플릿을 직접 만든다.
-  if (alert.source === 'collector_observe' || raw.observation) {
-    return formatCollectorFullTemplate(alert);
   }
 
   return '';
@@ -1637,7 +1639,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v047-telegram-ingest-stats-enrich', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: 'v048-telegram-ingest-force-rerender', mode: pool ? 'postgres' : 'memory', time: now(), alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
