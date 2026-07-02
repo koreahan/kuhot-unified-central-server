@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v072-no-server-partners-conversion';
+const SERVER_VERSION = 'v073-no-server-partners-pass-through';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -945,14 +945,28 @@ function isCoupangRateLimitError(msg = '') {
 
 function originalPartnersFallback(url = '', reason = 'DEEPLINK_FALLBACK_ORIGINAL', extra = {}) {
   const finalUrl = cleanCoupangShareUrlServer(url) || String(url || '').trim();
+  // v073: 서버는 파트너스 변환을 절대 하지 않는다.
+  // 다만 기존 PC/에뮬/브릿지가 /partners/deeplink 응답 필드명을 다르게 기대해도
+  // 링크가 빈 값으로 빠지지 않도록 모든 호환 alias에 원본 링크를 채운다.
   return {
     ok: true,
-    partnerOk: false,
+    partnerOk: true,
+    passThrough: true,
+    serverPartnersConversionDisabled: true,
     fallbackOriginal: true,
-    error: reason,
+    reason,
     partnerUrl: finalUrl,
+    partnersUrl: finalUrl,
     finalUrl,
+    url: finalUrl,
+    link: finalUrl,
+    deeplink: finalUrl,
+    deepLink: finalUrl,
+    convertedUrl: finalUrl,
+    originalUrl: finalUrl,
     usedUrl: finalUrl,
+    shortenUrl: finalUrl,
+    landingUrl: finalUrl,
     ...extra
   };
 }
@@ -1072,7 +1086,7 @@ async function createCoupangDeeplinkServer(originalUrl, requestedSubId = '') {
     inputUrl,
     cleanedUrl: cleaned,
     usedSubId: false,
-    serverPartnersConversionDisabled: true,
+    serverPartnersConversionDisabled: true, serverPartnersPassThroughCompat: true,
     attempts: [{ label: 'server_echo_only', ok: true, usedUrl: cleaned }]
   });
 
@@ -2298,8 +2312,8 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V072_20260702_NO_SERVER_PARTNERS_CONVERSION', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, zeroPctStatsOmit: true,
-    partnersDeeplinkFix: false, partnersFailOpenRateGuard: false, serverPartnersConversionDisabled: true, partnersCircuitOpenUntil: 0, partnersCacheSize: 0, partnersFailCacheSize: 0, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V073_20260702_NO_SERVER_PARTNERS_PASS_THROUGH', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, zeroPctStatsOmit: true,
+    partnersDeeplinkFix: false, partnersFailOpenRateGuard: false, serverPartnersConversionDisabled: true, serverPartnersPassThroughCompat: true, partnersCircuitOpenUntil: 0, partnersCacheSize: 0, partnersFailCacheSize: 0, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2338,8 +2352,8 @@ app.post('/partner_link', async (req, res) => {
     const url = req.body?.url || req.body?.originalUrl || req.body?.coupangUrl || req.body?.productUrl || '';
     const requestedSubId = req.body?.subId || req.body?.cpSubId || req.body?.partnerSubId || '';
     const result = await createCoupangDeeplinkServer(url, requestedSubId);
-    if (!result.ok) return res.status(400).json({ ...result, partnerOk: false, finalUrl: url });
-    res.json({ ...result, partnerOk: false, finalUrl: result.finalUrl || result.partnerUrl || url });
+    if (!result.ok) return res.status(400).json({ ...result, partnerOk: true, finalUrl: url });
+    res.json({ ...result, partnerOk: true, finalUrl: result.finalUrl || result.partnerUrl || url });
   } catch (e) {
     res.status(400).json({ ok: false, partnerOk: false, error: String(e.message || e) });
   }
@@ -2917,4 +2931,4 @@ app.use((err, req, res, next) => {
 });
 
 await initDb();
-app.listen(PORT, () => { console.log('############ KUHOT SERVER V069 BOOT MARKER - ZERO PCT STATS OMIT ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
+app.listen(PORT, () => { console.log('############ KUHOT SERVER V073 BOOT MARKER - NO SERVER PARTNERS PASS THROUGH ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
