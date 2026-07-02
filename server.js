@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v067-no-boot-heavy-index-diagnose';
+const SERVER_VERSION = 'v068-no-boot-indexes-diagnose';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -41,7 +41,8 @@ const STATS_SMART_SCAN_ENABLE = String(process.env.STATS_SMART_SCAN_ENABLE || 'f
 const PERF_LOG_ENABLED = String(process.env.PERF_LOG_ENABLED || 'true').toLowerCase() !== 'false'; // v065: 느린 요청 단계별 시간 로그
 const PERF_SLOW_MS = Number(process.env.PERF_SLOW_MS || 3000);
 const PERF_DEBUG_RESPONSE = String(process.env.PERF_DEBUG_RESPONSE || 'true').toLowerCase() !== 'false';
-const BOOT_FAST_INDEXES = String(process.env.BOOT_FAST_INDEXES || 'false').toLowerCase() === 'true'; // v067: 대용량 index는 부팅 중 기본 생성 금지. 실패 배포 방지
+const BOOT_SCHEMA_INDEXES = String(process.env.BOOT_SCHEMA_INDEXES || process.env.BOOT_FAST_INDEXES || 'false').toLowerCase() === 'true'; // v068: 부팅 중 모든 CREATE INDEX 기본 금지. 대용량 DB 배포 실패 방지
+const BOOT_FAST_INDEXES = BOOT_SCHEMA_INDEXES;
 
 
 app.use(cors());
@@ -978,7 +979,12 @@ async function initDb() {
     raw JSONB DEFAULT '{}'::jsonb,
     created_at BIGINT NOT NULL
   )`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC)`);
+  if (BOOT_SCHEMA_INDEXES) {
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC)`); }
+    catch (e) { console.warn('[initDb] index skipped idx_alerts_created_at:', String(e?.message || e)); }
+  } else {
+    console.log('[initDb] boot index skipped: idx_alerts_created_at');
+  }
   // 기존 DB에서 통합 서버로 교체해도 누락 컬럼이 있으면 자동 보강한다.
   await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS card_discount_pct DOUBLE PRECISION DEFAULT 0`);
   await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS original_url TEXT`);
@@ -1015,21 +1021,21 @@ async function initDb() {
     collected_at BIGINT NOT NULL,
     created_at BIGINT NOT NULL
   )`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time ON price_observations(product_key, option_key, collected_at DESC)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_created_at ON price_observations(created_at DESC)`);
-  // v067: 아래 3개는 기존 데이터가 많으면 Render 부팅 중 query timeout으로 배포가 죽을 수 있다.
-  // 기본값은 SKIP. 서버를 먼저 살리고, 필요하면 BOOT_FAST_INDEXES=true + timeout 상향 또는 DB 콘솔에서 별도 생성한다.
-  if (BOOT_FAST_INDEXES) {
-    try {
-      await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time_price ON price_observations(product_key, option_key, collected_at DESC) WHERE price > 0`);
-      await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_title_option_time_price ON price_observations(title_key, option_key, collected_at DESC) WHERE price > 0`);
-      await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_collected_time_price ON price_observations(collected_at DESC) WHERE price > 0`);
-      console.log('[initDb] optional fast indexes created');
-    } catch (e) {
-      console.warn('[initDb] optional fast indexes skipped:', String(e?.message || e));
+  if (BOOT_SCHEMA_INDEXES) {
+    const obsIndexes = [
+      [`idx_obs_product_option_time`, `CREATE INDEX IF NOT EXISTS idx_obs_product_option_time ON price_observations(product_key, option_key, collected_at DESC)`],
+      [`idx_obs_created_at`, `CREATE INDEX IF NOT EXISTS idx_obs_created_at ON price_observations(created_at DESC)`],
+      [`idx_obs_product_option_time_price`, `CREATE INDEX IF NOT EXISTS idx_obs_product_option_time_price ON price_observations(product_key, option_key, collected_at DESC) WHERE price > 0`],
+      [`idx_obs_title_option_time_price`, `CREATE INDEX IF NOT EXISTS idx_obs_title_option_time_price ON price_observations(title_key, option_key, collected_at DESC) WHERE price > 0`],
+      [`idx_obs_collected_time_price`, `CREATE INDEX IF NOT EXISTS idx_obs_collected_time_price ON price_observations(collected_at DESC) WHERE price > 0`],
+    ];
+    for (const [name, sql] of obsIndexes) {
+      try { await pool.query(sql); }
+      catch (e) { console.warn(`[initDb] index skipped ${name}:`, String(e?.message || e)); }
     }
+    console.log('[initDb] observation indexes create attempted');
   } else {
-    console.log('[initDb] optional fast indexes skipped by BOOT_FAST_INDEXES=false');
+    console.log('[initDb] boot observation indexes skipped by BOOT_SCHEMA_INDEXES=false');
   }
   await pool.query(`CREATE TABLE IF NOT EXISTS emul_price_stats (
     id TEXT PRIMARY KEY,
@@ -1050,11 +1056,22 @@ async function initDb() {
     last_seen_at BIGINT DEFAULT 0,
     updated_at BIGINT NOT NULL
   )`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_product_option ON emul_price_stats(product_key, option_key, updated_at DESC)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_title_option ON emul_price_stats(title_key, option_key, updated_at DESC)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_last_seen ON emul_price_stats(last_seen_at DESC)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_product_option_seen ON emul_price_stats(product_key, option_key, last_seen_at DESC) WHERE count > 0 AND avg_price > 0`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_emul_stats_title_option_seen ON emul_price_stats(title_key, option_key, last_seen_at DESC) WHERE count > 0 AND avg_price > 0`);
+  if (BOOT_SCHEMA_INDEXES) {
+    const emulIndexes = [
+      [`idx_emul_stats_product_option`, `CREATE INDEX IF NOT EXISTS idx_emul_stats_product_option ON emul_price_stats(product_key, option_key, updated_at DESC)`],
+      [`idx_emul_stats_title_option`, `CREATE INDEX IF NOT EXISTS idx_emul_stats_title_option ON emul_price_stats(title_key, option_key, updated_at DESC)`],
+      [`idx_emul_stats_last_seen`, `CREATE INDEX IF NOT EXISTS idx_emul_stats_last_seen ON emul_price_stats(last_seen_at DESC)`],
+      [`idx_emul_stats_product_option_seen`, `CREATE INDEX IF NOT EXISTS idx_emul_stats_product_option_seen ON emul_price_stats(product_key, option_key, last_seen_at DESC) WHERE count > 0 AND avg_price > 0`],
+      [`idx_emul_stats_title_option_seen`, `CREATE INDEX IF NOT EXISTS idx_emul_stats_title_option_seen ON emul_price_stats(title_key, option_key, last_seen_at DESC) WHERE count > 0 AND avg_price > 0`],
+    ];
+    for (const [name, sql] of emulIndexes) {
+      try { await pool.query(sql); }
+      catch (e) { console.warn(`[initDb] index skipped ${name}:`, String(e?.message || e)); }
+    }
+    console.log('[initDb] emul stats indexes create attempted');
+  } else {
+    console.log('[initDb] boot emul stats indexes skipped by BOOT_SCHEMA_INDEXES=false');
+  }
   await pool.query(`CREATE TABLE IF NOT EXISTS collector_workers (
     worker_id TEXT PRIMARY KEY,
     name TEXT,
@@ -2074,7 +2091,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V067_20260702_NO_BOOT_HEAVY_INDEX_DIAGNOSE', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V068_20260702_NO_BOOT_INDEXES_DIAGNOSE', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2679,4 +2696,4 @@ app.use((err, req, res, next) => {
 });
 
 await initDb();
-app.listen(PORT, () => { console.log('############ KUHOT SERVER V067 BOOT MARKER - NO BOOT HEAVY INDEX ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
+app.listen(PORT, () => { console.log('############ KUHOT SERVER V068 BOOT MARKER - NO BOOT INDEXES ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
