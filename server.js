@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v070-partners-deeplink-fix';
+const SERVER_VERSION = 'v072-no-server-partners-conversion';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -31,6 +31,13 @@ const MIN_HISTORY_COUNT = Number(process.env.MIN_HISTORY_COUNT || 2);
 const COUPANG_PARTNERS_ACCESS_KEY = process.env.COUPANG_PARTNERS_ACCESS_KEY || process.env.CP_ACCESS_KEY || '';
 const COUPANG_PARTNERS_SECRET_KEY = process.env.COUPANG_PARTNERS_SECRET_KEY || process.env.CP_SECRET_KEY || '';
 const COUPANG_PARTNERS_SUB_ID = process.env.COUPANG_PARTNERS_SUB_ID || process.env.CP_SUB_ID || '';
+const PARTNERS_DEEPLINK_DISABLE_API = String(process.env.PARTNERS_DEEPLINK_DISABLE_API || 'false').toLowerCase() === 'true';
+const PARTNERS_DEEPLINK_CACHE_MS = Number(process.env.PARTNERS_DEEPLINK_CACHE_MS || 6 * 60 * 60 * 1000);
+const PARTNERS_DEEPLINK_FAIL_CACHE_MS = Number(process.env.PARTNERS_DEEPLINK_FAIL_CACHE_MS || 2 * 60 * 1000);
+const PARTNERS_DEEPLINK_CIRCUIT_MS = Number(process.env.PARTNERS_DEEPLINK_CIRCUIT_MS || 70 * 1000);
+const partnersDeeplinkCache = new Map();
+const partnersDeeplinkFailCache = new Map();
+let partnersDeeplinkCircuitOpenUntil = 0;
 const FAST_NOTIFY_RESPONSE = String(process.env.FAST_NOTIFY_RESPONSE || 'true').toLowerCase() !== 'false'; // v061: 텔레그램/푸시는 백그라운드로 보내고 응답은 먼저 반환
 const SKIP_SILENT_OBSERVE_STATS = String(process.env.SKIP_SILENT_OBSERVE_STATS || 'false').toLowerCase() === 'true'; // v062: 평균/최저 보존 기본값. true로 넣은 경우에만 무알림 관측 stats 생략
 const OBSERVE_STATS_TIMEOUT_MS = Number(process.env.OBSERVE_STATS_TIMEOUT_MS || STATS_TIMEOUT_MS);
@@ -899,6 +906,57 @@ ${alert.url || ''}`).trim();
 
 
 
+
+function partnersCacheKey(url = '', subId = '') {
+  return `${cleanCoupangShareUrlServer(url)}::${String(subId || '').trim()}`;
+}
+
+function getPartnersCache(url = '', subId = '') {
+  const key = partnersCacheKey(url, subId);
+  const hit = partnersDeeplinkCache.get(key);
+  if (hit && hit.expiresAt > Date.now() && hit.partnerUrl) return hit;
+  if (hit) partnersDeeplinkCache.delete(key);
+  return null;
+}
+
+function setPartnersCache(url = '', subId = '', partnerUrl = '', meta = {}) {
+  const key = partnersCacheKey(url, subId);
+  if (!partnerUrl) return;
+  partnersDeeplinkCache.set(key, { partnerUrl, expiresAt: Date.now() + PARTNERS_DEEPLINK_CACHE_MS, ...meta });
+}
+
+function getPartnersFailCache(url = '', subId = '') {
+  const key = partnersCacheKey(url, subId);
+  const hit = partnersDeeplinkFailCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit;
+  if (hit) partnersDeeplinkFailCache.delete(key);
+  return null;
+}
+
+function setPartnersFailCache(url = '', subId = '', error = 'DEEPLINK_FAILED', meta = {}) {
+  const key = partnersCacheKey(url, subId);
+  partnersDeeplinkFailCache.set(key, { error, expiresAt: Date.now() + PARTNERS_DEEPLINK_FAIL_CACHE_MS, ...meta });
+}
+
+function isCoupangRateLimitError(msg = '') {
+  const t = String(msg || '');
+  return /사용 횟수|1분당\s*100회|초과|rate.?limit|too many/i.test(t);
+}
+
+function originalPartnersFallback(url = '', reason = 'DEEPLINK_FALLBACK_ORIGINAL', extra = {}) {
+  const finalUrl = cleanCoupangShareUrlServer(url) || String(url || '').trim();
+  return {
+    ok: true,
+    partnerOk: false,
+    fallbackOriginal: true,
+    error: reason,
+    partnerUrl: finalUrl,
+    finalUrl,
+    usedUrl: finalUrl,
+    ...extra
+  };
+}
+
 function coupangSignedDate() {
   // Coupang Partners Open API signature uses YYMMDDTHHMMSSZ.
   // v069 used full year and query-style subId, which can make server deeplink fail.
@@ -1007,6 +1065,35 @@ async function createCoupangDeeplinkServer(originalUrl, requestedSubId = '') {
   const cleaned = cleanCoupangShareUrlServer(inputUrl);
   const attempts = [];
 
+  // v072: 서버에서는 Coupang Partners API를 절대 호출하지 않는다.
+  // 원래 구조처럼 PC/에뮬/브릿지가 이미 가진 링크를 그대로 서버가 보존만 한다.
+  // /partners/deeplink, /partner_link 는 호환용 echo 엔드포인트로만 유지한다.
+  return originalPartnersFallback(cleaned, 'SERVER_PARTNERS_CONVERSION_DISABLED', {
+    inputUrl,
+    cleanedUrl: cleaned,
+    usedSubId: false,
+    serverPartnersConversionDisabled: true,
+    attempts: [{ label: 'server_echo_only', ok: true, usedUrl: cleaned }]
+  });
+
+  const goodCache = getPartnersCache(cleaned, subId);
+  if (goodCache) {
+    return { ok: true, partnerOk: true, cacheHit: true, partnerUrl: goodCache.partnerUrl, finalUrl: goodCache.partnerUrl, inputUrl, usedUrl: goodCache.usedUrl || cleaned, usedSubId: !!subId, attempts: [{ label: 'cache', ok: true, usedUrl: goodCache.usedUrl || cleaned }] };
+  }
+
+  if (PARTNERS_DEEPLINK_DISABLE_API) {
+    return originalPartnersFallback(cleaned, 'DEEPLINK_API_DISABLED', { inputUrl, cleanedUrl: cleaned, usedSubId: !!subId, attempts: [{ label: 'disabled', ok: false, usedUrl: cleaned }] });
+  }
+
+  if (partnersDeeplinkCircuitOpenUntil > Date.now()) {
+    return originalPartnersFallback(cleaned, 'DEEPLINK_RATE_LIMIT_CIRCUIT_OPEN', { inputUrl, cleanedUrl: cleaned, circuitOpenUntil: partnersDeeplinkCircuitOpenUntil, usedSubId: !!subId, attempts: [{ label: 'circuit_open', ok: false, usedUrl: cleaned }] });
+  }
+
+  const failCache = getPartnersFailCache(cleaned, subId);
+  if (failCache) {
+    return originalPartnersFallback(cleaned, failCache.error || 'DEEPLINK_FAIL_CACHE', { inputUrl, cleanedUrl: cleaned, failCacheHit: true, usedSubId: !!subId, attempts: [{ label: 'fail_cache', ok: false, usedUrl: cleaned, error: failCache.error || 'DEEPLINK_FAIL_CACHE' }] });
+  }
+
   const resolved = await resolveCoupangShortUrlServer(cleaned);
   const candidates = [];
   if (resolved) candidates.push({ label: resolved !== cleaned ? 'resolved_short_url' : 'cleaned_url', url: resolved });
@@ -1021,13 +1108,34 @@ async function createCoupangDeeplinkServer(originalUrl, requestedSubId = '') {
       const result = await coupangDeeplinkApiCallServer(u, subId);
       attempts.push({ label: c.label, ok: !!result.ok, usedUrl: u });
       if (result.ok) {
-        return { ...result, inputUrl, usedUrl: u, usedSubId: !!subId, attempts };
+        setPartnersCache(cleaned, subId, result.partnerUrl, { usedUrl: u });
+        return { ...result, partnerOk: true, finalUrl: result.partnerUrl, inputUrl, usedUrl: u, usedSubId: !!subId, attempts };
       }
       attempts.push({ label: c.label, ok: false, usedUrl: u, error: result.error || 'NOT_OK' });
     } catch (e) {
-      attempts.push({ label: c.label, ok: false, usedUrl: u, error: String(e.message || e).slice(0, 220) });
+      const errText = String(e.message || e);
+      attempts.push({ label: c.label, ok: false, usedUrl: u, error: errText.slice(0, 220) });
+      if (isCoupangRateLimitError(errText)) {
+        partnersDeeplinkCircuitOpenUntil = Date.now() + PARTNERS_DEEPLINK_CIRCUIT_MS;
+        setPartnersFailCache(cleaned, subId, 'DEEPLINK_RATE_LIMITED_FALLBACK_ORIGINAL', { attempts });
+        return originalPartnersFallback(cleaned, 'DEEPLINK_RATE_LIMITED_FALLBACK_ORIGINAL', { inputUrl, cleanedUrl: cleaned, resolvedUrl: resolved, circuitOpenUntil: partnersDeeplinkCircuitOpenUntil, usedSubId: !!subId, attempts });
+      }
     }
   }
+
+  setPartnersFailCache(cleaned, subId, 'DEEPLINK_FAILED_FALLBACK_ORIGINAL', { attempts });
+  return originalPartnersFallback(cleaned, 'DEEPLINK_FAILED_FALLBACK_ORIGINAL', {
+    inputUrl,
+    cleanedUrl: cleaned,
+    resolvedUrl: resolved,
+    usedSubId: !!subId,
+    env: {
+      accessKey: !!String(COUPANG_PARTNERS_ACCESS_KEY || '').trim(),
+      secretKey: !!String(COUPANG_PARTNERS_SECRET_KEY || '').trim(),
+      subId: !!subId
+    },
+    attempts
+  });
 
   return {
     ok: false,
@@ -2190,8 +2298,8 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V070_20260702_PARTNERS_DEEPLINK_FIX', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, zeroPctStatsOmit: true,
-    partnersDeeplinkFix: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V072_20260702_NO_SERVER_PARTNERS_CONVERSION', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, zeroPctStatsOmit: true,
+    partnersDeeplinkFix: false, partnersFailOpenRateGuard: false, serverPartnersConversionDisabled: true, partnersCircuitOpenUntil: 0, partnersCacheSize: 0, partnersFailCacheSize: 0, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2211,7 +2319,7 @@ app.get('/debug/latest', async (req, res) => {
 
 
 
-// 배포용 확장프로그램: 파트너스 키를 확장 안에 넣지 않고 서버 환경변수로 딥링크 생성
+// v072 호환용: 서버는 파트너스 변환을 하지 않고 받은 쿠팡 링크를 그대로 돌려준다
 app.post('/partners/deeplink', async (req, res) => {
   try {
     const url = req.body?.url || req.body?.originalUrl || req.body?.coupangUrl || req.body?.productUrl || '';
@@ -2224,14 +2332,14 @@ app.post('/partners/deeplink', async (req, res) => {
   }
 });
 
-// 브릿지 호환용 별칭. 기존 에뮬/PC가 /partner_link 형식으로 물어도 서버가 직접 응답한다.
+// v072 호환용 별칭: 기존 에뮬/PC가 /partner_link를 호출해도 원본 링크를 그대로 반환한다.
 app.post('/partner_link', async (req, res) => {
   try {
     const url = req.body?.url || req.body?.originalUrl || req.body?.coupangUrl || req.body?.productUrl || '';
     const requestedSubId = req.body?.subId || req.body?.cpSubId || req.body?.partnerSubId || '';
     const result = await createCoupangDeeplinkServer(url, requestedSubId);
     if (!result.ok) return res.status(400).json({ ...result, partnerOk: false, finalUrl: url });
-    res.json({ ...result, partnerOk: true, finalUrl: result.partnerUrl });
+    res.json({ ...result, partnerOk: false, finalUrl: result.finalUrl || result.partnerUrl || url });
   } catch (e) {
     res.status(400).json({ ok: false, partnerOk: false, error: String(e.message || e) });
   }
