@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v068-no-boot-indexes-diagnose';
+const SERVER_VERSION = 'v069-zero-pct-stats-omit';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -718,13 +718,13 @@ function formatCollectorFullTemplate(a) {
   lines.push(`${label} ${won(price)}`);
   if (a.cardText) lines.push(`💳 (${a.cardText})`);
   lines.push('');
-  if (avg > 0) lines.push(`📉 평균 ${won(avg)} · 🔻${formatPct1(avgDrop)}% (${won(avgDiff)})`);
-  if (low > 0 && avg !== low) {
-    if (price > 0 && Math.round(price) === Math.round(low)) {
-      lines.push('🏆 기존 최저가와 동일');
-    } else if (price > 0 && price < low) {
-      lines.push(`🏆 최저 ${won(low)} · 🔻${formatPct1(lowDrop)}% (${won(lowDiff)})`);
-    }
+  // v069: 평균/최저가 현재가와 같거나 할인액이 0원인 경우에는 표시하지 않는다.
+  // 예: 평균 11,400원 · 0% (0원) 같은 무의미한 줄은 텔레그램 출력에서 생략.
+  const showAvgLine = avg > 0 && price > 0 && avg > price && avgDiff > 0 && avgDrop > 0.05;
+  const showLowLine = low > 0 && price > 0 && low > price && lowDiff > 0 && lowDrop > 0.05;
+  if (showAvgLine) lines.push(`📉 평균 ${won(avg)} · 🔻${formatPct1(avgDrop)}% (${won(avgDiff)})`);
+  if (showLowLine && avg !== low) {
+    lines.push(`🏆 최저 ${won(low)} · 🔻${formatPct1(lowDrop)}% (${won(lowDiff)})`);
   }
   lines.push('');
   lines.push('🔗 상세보기 및 구매하기');
@@ -2091,7 +2091,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V068_20260702_NO_BOOT_INDEXES_DIAGNOSE', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V069_20260702_ZERO_PCT_STATS_OMIT', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, zeroPctStatsOmit: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2696,4 +2696,4 @@ app.use((err, req, res, next) => {
 });
 
 await initDb();
-app.listen(PORT, () => { console.log('############ KUHOT SERVER V068 BOOT MARKER - NO BOOT INDEXES ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
+app.listen(PORT, () => { console.log('############ KUHOT SERVER V069 BOOT MARKER - ZERO PCT STATS OMIT ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
