@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v069-zero-pct-stats-omit';
+const SERVER_VERSION = 'v070-partners-deeplink-fix';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -900,9 +900,12 @@ ${alert.url || ''}`).trim();
 
 
 function coupangSignedDate() {
+  // Coupang Partners Open API signature uses YYMMDDTHHMMSSZ.
+  // v069 used full year and query-style subId, which can make server deeplink fail.
   const d = new Date();
   const pad = (x) => String(x).padStart(2, '0');
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  return `${yy}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
 }
 
 function isCoupangUrl(url) {
@@ -914,36 +917,132 @@ function isCoupangUrl(url) {
   }
 }
 
-async function createCoupangDeeplinkServer(originalUrl, requestedSubId = '') {
+function cleanCoupangShareUrlServer(rawUrl) {
+  const raw = String(rawUrl || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    const drop = new Set(['abtestinfo', 'q', 'src', 'spec', 'addtag', 'ctag']);
+    for (const k of [...u.searchParams.keys()]) {
+      if (drop.has(String(k).toLowerCase())) u.searchParams.delete(k);
+    }
+    u.hash = '';
+    return u.toString();
+  } catch (_) {
+    return raw;
+  }
+}
+
+async function resolveCoupangShortUrlServer(rawUrl) {
+  const url = cleanCoupangShareUrlServer(rawUrl);
+  if (!url) return '';
+  try {
+    const u = new URL(url);
+    if (!/(^|\.)link\.coupang\.com$/i.test(u.hostname)) return url;
+  } catch (_) {
+    return url;
+  }
+
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 Mobile Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Referer': 'https://www.coupang.com/'
+  };
+
+  for (const method of ['HEAD', 'GET']) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7000);
+    try {
+      const r = await fetch(url, { method, headers, redirect: 'follow', signal: controller.signal });
+      const finalUrl = cleanCoupangShareUrlServer(r.url || '');
+      if (finalUrl && /coupang\.com/i.test(finalUrl) && !/link\.coupang\.com/i.test(finalUrl)) return finalUrl;
+    } catch (_) {
+      // try next method
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return url;
+}
+
+async function coupangDeeplinkApiCallServer(url, subId = '') {
   const accessKey = String(COUPANG_PARTNERS_ACCESS_KEY || '').trim();
   const secretKey = String(COUPANG_PARTNERS_SECRET_KEY || '').trim();
-  const requested = String(requestedSubId || '').trim();
-  const safeRequested = /^[A-Za-z0-9._-]{1,64}$/.test(requested) ? requested : '';
-  const subId = safeRequested || String(COUPANG_PARTNERS_SUB_ID || '').trim();
-  const url = String(originalUrl || '').trim();
-  if (!url) throw new Error('EMPTY_URL');
-  if (!isCoupangUrl(url)) throw new Error('NOT_COUPANG_URL');
-  if (!accessKey || !secretKey || !subId) return { ok: false, skipped: true, error: 'COUPANG_PARTNERS_ENV_MISSING' };
+  if (!accessKey || !secretKey) return { ok: false, skipped: true, error: 'COUPANG_PARTNERS_ENV_MISSING' };
 
   const apiPath = '/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink';
-  const query = `_E_=${encodeURIComponent(subId)}`;
   const signedDate = coupangSignedDate();
-  const message = signedDate + 'POST' + apiPath + query;
+  const message = signedDate + 'POST' + apiPath;
   const signature = crypto.createHmac('sha256', secretKey).update(message).digest('hex');
   const authorization = `CEA algorithm=HmacSHA256, access-key=${accessKey}, signed-date=${signedDate}, signature=${signature}`;
 
-  const r = await fetch(`https://api-gateway.coupang.com${apiPath}?${query}`, {
+  const body = { coupangUrls: [url] };
+  const sid = String(subId || '').trim();
+  if (/^[A-Za-z0-9._-]{1,64}$/.test(sid)) body.subId = sid;
+
+  const r = await fetch(`https://api-gateway.coupang.com${apiPath}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: authorization },
-    body: JSON.stringify({ coupangUrls: [url] })
+    headers: { 'Content-Type': 'application/json;charset=UTF-8', Authorization: authorization },
+    body: JSON.stringify(body)
   });
   const data = await r.json().catch(() => null);
   if (!r.ok || !data) throw new Error(`DEEPLINK_HTTP_${r.status}`);
   if ((data.rCode === '0' || data.rCode === '0000') && Array.isArray(data.data) && data.data.length) {
     const item = data.data[0] || {};
-    return { ok: true, partnerUrl: item.shortenUrl || item.landingUrl || '', shortenUrl: item.shortenUrl || '', landingUrl: item.landingUrl || '', raw: data };
+    const partnerUrl = item.shortenUrl || item.landingUrl || '';
+    if (partnerUrl) return { ok: true, partnerUrl, shortenUrl: item.shortenUrl || '', landingUrl: item.landingUrl || '', raw: data };
   }
-  throw new Error(data.message || data.rMessage || 'DEEPLINK_API_ERROR');
+  throw new Error(data.message || data.rMessage || data.rCode || 'DEEPLINK_API_ERROR');
+}
+
+async function createCoupangDeeplinkServer(originalUrl, requestedSubId = '') {
+  const requested = String(requestedSubId || '').trim();
+  const safeRequested = /^[A-Za-z0-9._-]{1,64}$/.test(requested) ? requested : '';
+  const subId = safeRequested || String(COUPANG_PARTNERS_SUB_ID || '').trim();
+  const inputUrl = String(originalUrl || '').trim();
+  if (!inputUrl) throw new Error('EMPTY_URL');
+  if (!isCoupangUrl(inputUrl)) throw new Error('NOT_COUPANG_URL');
+
+  const cleaned = cleanCoupangShareUrlServer(inputUrl);
+  const attempts = [];
+
+  const resolved = await resolveCoupangShortUrlServer(cleaned);
+  const candidates = [];
+  if (resolved) candidates.push({ label: resolved !== cleaned ? 'resolved_short_url' : 'cleaned_url', url: resolved });
+  if (cleaned && cleaned !== resolved) candidates.push({ label: 'cleaned_original', url: cleaned });
+
+  const seen = new Set();
+  for (const c of candidates) {
+    const u = String(c.url || '').trim();
+    if (!u || seen.has(u)) continue;
+    seen.add(u);
+    try {
+      const result = await coupangDeeplinkApiCallServer(u, subId);
+      attempts.push({ label: c.label, ok: !!result.ok, usedUrl: u });
+      if (result.ok) {
+        return { ...result, inputUrl, usedUrl: u, usedSubId: !!subId, attempts };
+      }
+      attempts.push({ label: c.label, ok: false, usedUrl: u, error: result.error || 'NOT_OK' });
+    } catch (e) {
+      attempts.push({ label: c.label, ok: false, usedUrl: u, error: String(e.message || e).slice(0, 220) });
+    }
+  }
+
+  return {
+    ok: false,
+    error: 'DEEPLINK_ALL_ATTEMPTS_FAILED',
+    inputUrl,
+    cleanedUrl: cleaned,
+    resolvedUrl: resolved,
+    usedSubId: !!subId,
+    env: {
+      accessKey: !!String(COUPANG_PARTNERS_ACCESS_KEY || '').trim(),
+      secretKey: !!String(COUPANG_PARTNERS_SECRET_KEY || '').trim(),
+      subId: !!subId
+    },
+    attempts
+  };
 }
 
 async function initDb() {
@@ -2091,7 +2190,8 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V069_20260702_ZERO_PCT_STATS_OMIT', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, zeroPctStatsOmit: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V070_20260702_PARTNERS_DEEPLINK_FIX', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, zeroPctStatsOmit: true,
+    partnersDeeplinkFix: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, bootSchemaIndexes: BOOT_SCHEMA_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2114,13 +2214,26 @@ app.get('/debug/latest', async (req, res) => {
 // 배포용 확장프로그램: 파트너스 키를 확장 안에 넣지 않고 서버 환경변수로 딥링크 생성
 app.post('/partners/deeplink', async (req, res) => {
   try {
-    const url = req.body?.url || req.body?.originalUrl || req.body?.coupangUrl || '';
+    const url = req.body?.url || req.body?.originalUrl || req.body?.coupangUrl || req.body?.productUrl || '';
     const requestedSubId = req.body?.subId || req.body?.cpSubId || req.body?.partnerSubId || '';
     const result = await createCoupangDeeplinkServer(url, requestedSubId);
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
   } catch (e) {
     res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// 브릿지 호환용 별칭. 기존 에뮬/PC가 /partner_link 형식으로 물어도 서버가 직접 응답한다.
+app.post('/partner_link', async (req, res) => {
+  try {
+    const url = req.body?.url || req.body?.originalUrl || req.body?.coupangUrl || req.body?.productUrl || '';
+    const requestedSubId = req.body?.subId || req.body?.cpSubId || req.body?.partnerSubId || '';
+    const result = await createCoupangDeeplinkServer(url, requestedSubId);
+    if (!result.ok) return res.status(400).json({ ...result, partnerOk: false, finalUrl: url });
+    res.json({ ...result, partnerOk: true, finalUrl: result.partnerUrl });
+  } catch (e) {
+    res.status(400).json({ ok: false, partnerOk: false, error: String(e.message || e) });
   }
 });
 
