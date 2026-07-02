@@ -10,7 +10,7 @@ const app = express();
 const expo = new Expo();
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = 'v066-boot-marker-diagnose';
+const SERVER_VERSION = 'v067-no-boot-heavy-index-diagnose';
 const HEAVY_MAX_ACTIVE = Number(process.env.HEAVY_MAX_ACTIVE || 12);
 const HEAVY_RETRY_AFTER_MS = Number(process.env.HEAVY_RETRY_AFTER_MS || 10000);
 const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 2500);
@@ -41,6 +41,7 @@ const STATS_SMART_SCAN_ENABLE = String(process.env.STATS_SMART_SCAN_ENABLE || 'f
 const PERF_LOG_ENABLED = String(process.env.PERF_LOG_ENABLED || 'true').toLowerCase() !== 'false'; // v065: 느린 요청 단계별 시간 로그
 const PERF_SLOW_MS = Number(process.env.PERF_SLOW_MS || 3000);
 const PERF_DEBUG_RESPONSE = String(process.env.PERF_DEBUG_RESPONSE || 'true').toLowerCase() !== 'false';
+const BOOT_FAST_INDEXES = String(process.env.BOOT_FAST_INDEXES || 'false').toLowerCase() === 'true'; // v067: 대용량 index는 부팅 중 기본 생성 금지. 실패 배포 방지
 
 
 app.use(cors());
@@ -1016,10 +1017,20 @@ async function initDb() {
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time ON price_observations(product_key, option_key, collected_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_created_at ON price_observations(created_at DESC)`);
-  // v064: 평균/최저/일일저장 정책용 빠른 exact index. title ILIKE 대량검색 대신 이 인덱스를 우선 사용한다.
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time_price ON price_observations(product_key, option_key, collected_at DESC) WHERE price > 0`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_title_option_time_price ON price_observations(title_key, option_key, collected_at DESC) WHERE price > 0`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_collected_time_price ON price_observations(collected_at DESC) WHERE price > 0`);
+  // v067: 아래 3개는 기존 데이터가 많으면 Render 부팅 중 query timeout으로 배포가 죽을 수 있다.
+  // 기본값은 SKIP. 서버를 먼저 살리고, 필요하면 BOOT_FAST_INDEXES=true + timeout 상향 또는 DB 콘솔에서 별도 생성한다.
+  if (BOOT_FAST_INDEXES) {
+    try {
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_product_option_time_price ON price_observations(product_key, option_key, collected_at DESC) WHERE price > 0`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_title_option_time_price ON price_observations(title_key, option_key, collected_at DESC) WHERE price > 0`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_obs_collected_time_price ON price_observations(collected_at DESC) WHERE price > 0`);
+      console.log('[initDb] optional fast indexes created');
+    } catch (e) {
+      console.warn('[initDb] optional fast indexes skipped:', String(e?.message || e));
+    }
+  } else {
+    console.log('[initDb] optional fast indexes skipped by BOOT_FAST_INDEXES=false');
+  }
   await pool.query(`CREATE TABLE IF NOT EXISTS emul_price_stats (
     id TEXT PRIMARY KEY,
     stat_key TEXT UNIQUE NOT NULL,
@@ -2063,7 +2074,7 @@ async function sendPush(alert) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V066_20260702_BOOT_MARKER_DIAGNOSE', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
+  res.json({ ok: true, service: 'KUHOT_UNIFIED_CENTRAL', app: 'KUHOT', version: SERVER_VERSION, deployMarker: 'SERVER_V067_20260702_NO_BOOT_HEAVY_INDEX_DIAGNOSE', mode: pool ? 'postgres' : 'memory', time: now(), uptimeMs: now() - startedAt, activeHeavyRequests, rejectedHeavyRequests, timedOutStatsRequests, heavyMaxActive: HEAVY_MAX_ACTIVE, heavyRetryAfterMs: HEAVY_RETRY_AFTER_MS, statsTimeoutMs: STATS_TIMEOUT_MS, observeStatsTimeoutMs: OBSERVE_STATS_TIMEOUT_MS, dbQueryTimeoutMs: DB_QUERY_TIMEOUT_MS, dbConnectTimeoutMs: DB_CONNECT_TIMEOUT_MS, statsCacheTtlMs: STATS_CACHE_TTL_MS, statsCacheSize: statsMemoryCache.size, statsEnableTitleIlike: STATS_ENABLE_TITLE_ILIKE, dailySaveEnableTitleIlike: DAILY_SAVE_ENABLE_TITLE_ILIKE, statsSmartScanEnable: STATS_SMART_SCAN_ENABLE, dbTimeoutFastIndexes: true, deliveryBadgePreserved: true, perfTimingDiagnose: true, perfLogEnabled: PERF_LOG_ENABLED, perfSlowMs: PERF_SLOW_MS, perfDebugResponse: PERF_DEBUG_RESPONSE, bootFastIndexes: BOOT_FAST_INDEXES, pruneIntervalMs: PRUNE_INTERVAL_MS, lastPruneAt, fastNotifyResponse: FAST_NOTIFY_RESPONSE, skipSilentObserveStats: SKIP_SILENT_OBSERVE_STATS, backgroundTelegramQueued, backgroundTelegramSent, backgroundTelegramFailed, backgroundPushQueued, backgroundPushSent, backgroundPushFailed, alertRetentionMs: ALERT_RETENTION_MS, priceRetentionMs: PRICE_RETENTION_MS });
 });
 
 app.post('/devices/register', async (req, res) => {
@@ -2668,4 +2679,4 @@ app.use((err, req, res, next) => {
 });
 
 await initDb();
-app.listen(PORT, () => { console.log('############ KUHOT SERVER V066 BOOT MARKER ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
+app.listen(PORT, () => { console.log('############ KUHOT SERVER V067 BOOT MARKER - NO BOOT HEAVY INDEX ############'); console.log(`[wowdrop-central] listening :${PORT} mode=${pool ? 'postgres' : 'memory'} version=${SERVER_VERSION} heavyMax=${HEAVY_MAX_ACTIVE}`); });
